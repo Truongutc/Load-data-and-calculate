@@ -12,6 +12,7 @@ from .vsa_engine       import analyze_vsa
 from .ma_engine        import analyze_ma_trend
 from .advanced_entry   import classify_entry
 from .accumulation_engine import analyze_accumulation
+from .valuation_engine import evaluate_stock_valuation
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +40,12 @@ def analyze_stock(ticker: str, df: pd.DataFrame) -> dict:
     
     last = df.iloc[-1]
     
-    ma20 = df['Close'].rolling(20).mean().iloc[-1]
-    ma50 = df['Close'].rolling(50).mean().iloc[-1]
+    # 3. Valuation & Risk Management (AIC Style)
+    valuation = evaluate_stock_valuation(ticker, df_rich, adv)
     
+    # Store close_26 for Chikou analysis in report
+    close_26 = df_rich['Close'].iloc[-26] if len(df_rich) > 26 else df_rich['Close'].iloc[0]
+
     return {
         "ticker": ticker.upper(),
         "price": float(last["Close"]),
@@ -51,139 +55,147 @@ def analyze_stock(ticker: str, df: pd.DataFrame) -> dict:
         "ma_trend": ma_trend,
         "adv": adv,
         "accum": accum,
-        "ma20": ma20,
-        "ma50": ma50,
-        "close": last["Close"]
+        "valuation": valuation,
+        "close_26": float(close_26),
+        # Supporting legacy keys if any
+        "ma20": float(df_rich['MA20'].iloc[-1]),
+        "ma50": float(df_rich['MA50'].iloc[-1])
     }
 
 
 def format_report(result: dict) -> str:
-    """
-    Format the output of analyze_stock() as a human-readable conversational text report.
-    """
+    """Format the cumulative results into a professional AIC code report."""
+    if not result:
+        return "Lỗi: Không có dữ liệu phân tích."
+
     t = result["ticker"]
     price = result["price"]
     date = result["date"]
+    val = result.get("valuation", {})
+    adv = result.get("adv", {})
+    ichi = result.get("ichi", {})
+    ma_trend = result.get("ma_trend", {})
     
-    ichi = result["ichi"]
-    vsa = result["vsa"]
-    ma_trend = result["ma_trend"]
-    adv = result["adv"]
-    accum = result["accum"]
-    
-    close = result["close"]
-    ma20 = result["ma20"]
-    ma50 = result["ma50"]
-    
-    sep  = "═" * 70
+    # Extract valuation data
+    s1, s2 = val.get("s1", 0), val.get("s2", 0)
+    r1, r2 = val.get("r1", 0), val.get("r2", 0)
+    tp1, tp2 = val.get("tp1", 0), val.get("tp2", 0)
+    sl1, sl2 = val.get("cutloss_partial", 0), val.get("cutloss_full", 0)
+    ts = val.get("trailing_stop", 0)
+    bb = val.get("break_buy", 0)
+    rs = val.get("risk_score", 0)
+    rd = val.get("risk_desc", "N/A")
+    rr = val.get("rr_ratio", 0)
+    action = val.get("action", "WAIT")
+    state = val.get("state", "UNKNOWN")
+
+    sep = "═" * 70
     sep2 = "─" * 70
-    
+
     lines = [
         "",
         sep,
-        f"  📊  TINVEST – BÁO CÁO PHÂN TÍCH TỔNG HỢP: {t}",
+        f"  📊  AIC code = AI + cơm! – BÁO CÁO PHÂN TÍCH TỔNG HỢP: {t}",
         f"  Ngày: {date}  |  Giá: {price:,.2f}",
         sep,
         ""
     ]
+
+    # --- 1. PHÂN TÍCH INDICATOR (GIẢI THÍCH BẮT BUỘC) ---
+    lines.append("  [1. PHÂN TÍCH INDICATOR - GIẢI THÍCH KỸ THUẬT]")
     
-    # --- 1. ICHIMOKU ---
-    lines.append("  [1. ICHIMOKU - XU HƯỚNG ĐÁM MÂY]")
-    kumo_status = "Trên mây" if ichi['price_vs_kumo'] == 'above' else "Dưới mây hoặc Trong mây"
-    tk_cross = "Tenkan > Kijun" if ichi['tenkan_kijun_cross'] == 'bullish' else "Tenkan < Kijun"
+    # MA Explanation
+    ma_state = "Tích cực (Giá > MA20)" if price >= result.get("ma20", 0) else "Tiêu cực (Giá < MA20)"
+    lines.append(f"  • Moving Average: {ma_state}")
+    lines.append("    - Ý nghĩa: MA20 là 'sợi dây sinh mệnh'. Giá trên MA20 là xu hướng ngắn hạn tăng.")
+    if ma_trend.get("is_perfect_uptrend"):
+        lines.append("    - Cấu trúc: MA10 > 20 > 50 > 100 (Perfect Trend) - Dòng tiền đang vào rất mạnh.")
     
-    lines.append(f"  • Vị thế giá : {kumo_status}")
-    lines.append(f"  • Động lượng : {tk_cross}")
+    # Ichimoku Explanation
+    tk_cross = "Cực mạnh (Tenkan > Kijun)" if ichi.get("tenkan_kijun_cross") == 'bullish' else "Yếu (Tenkan < Kijun)"
+    kumo_pos = "Uptrend (Trên mây)" if ichi.get("price_vs_kumo") == 'above' else ("Sideway (Trong mây)" if ichi.get("price_vs_kumo") == 'inside' else "Downtrend (Dưới mây)")
+    lines.append(f"  • Ichimoku: {kumo_pos} | Momentum: {tk_cross}")
+    lines.append("    - Ý nghĩa: Tenkan/Kijun thể hiện xung lực. Giá trên mây xác nhận chu kỳ tăng dài hạn.")
     
-    if ichi['price_vs_kumo'] == 'above' and ichi['tenkan_kijun_cross'] == 'bullish':
-        ichi_eval = "MẠNH (Đang trong trend tăng chuẩn Ichimoku)"
-    elif ichi['price_vs_kumo'] == 'below':
-        ichi_eval = "YẾU (Nằm dưới mây chìm trong downtrend)"
-    else:
-        ichi_eval = "TRUNG TÍNH (Đang tích lũy hoặc chưa bứt thoát đám mây)"
-    lines.append(f"  => Đánh giá chung: Xu hướng Ichimoku hiện tại đang {ichi_eval}.")
+    # Chikou Explanation
+    chikou_status = "Thông thoáng (Clear)" if price > result.get("close_26", 0) else "Bị cản (Blocked)"
+    lines.append(f"  • Chikou Span: {chikou_status}")
+    lines.append("    - Ý nghĩa: Chikou không bị giá quá khứ cản sẽ giúp trend 'sạch', ít rung lắc.")
+
+    # Kijun65 Explanation
+    k65 = val.get("details", {}).get("k65", 0)
+    k65_status = "Khỏe (Giá > Kijun65)" if price > k65 else "Rủi ro (Giá < Kijun65)"
+    lines.append(f"  • Dao Găm 65: {k65_status} ({k65:,.2f})")
+    lines.append("    - Ý nghĩa: Là mốc hỗ trợ/kháng cự tâm lý trung hạn cực kỳ quan trọng.")
     lines.append("")
-    
-    # --- 2. MOVING AVERAGE ---
-    lines.append("  [2. MOVING AVERAGE - HÀNH VI ĐƯỜNG GIÁ]")
-    ma20_status = "Giữ được trend ngắn hạn" if close >= ma20 else "Mất MA20 (Rủi ro ngắn hạn)"
-    ma50_status = "Giữ được trend trung hạn" if close >= ma50 else "Thủng MA50 (Rủi ro trung hạn)"
-    
-    lines.append(f"  • Ngắn hạn (MA20): Giá đang {'nằm TRÊN' if close >= ma20 else 'nằm DƯỚI'} MA20 ({ma20_status})")
-    lines.append(f"  • Trung hạn (MA50): Giá đang {'nằm TRÊN' if close >= ma50 else 'nằm DƯỚI'} MA50 ({ma50_status})")
-    
-    if ma_trend['is_perfect_uptrend']:
-        lines.append("  • Cấu trúc     : MA10 > MA20 > MA50 > 100 > 200 (Xòe quạt hướng lên)")
-        ma_eval = "RẤT MẠNH (Cổ phiếu đang trên đà Siêu Điểm Mua - Siêu Trend)"
-    elif close >= ma20 and close >= ma50:
-        ma_eval = "TÍCH CỰC (Đang giữ thành công các mốc hỗ trợ quan trọng)"
-    elif close < ma20 and close < ma50:
-        ma_eval = "TIÊU CỰC (Giá cắm đầu dưới các đường dây trung bình)"
-    else:
-        ma_eval = "GIẰNG CO (Giá đang kẹp giữa MA20 và MA50)"
-    lines.append(f"  => Đánh giá chung: Cấu trúc MA cho thấy cổ phiếu đang {ma_eval}.")
+
+    # --- 2. XÁC ĐỊNH TRẠNG THÁI CỔ PHIẾU ---
+    lines.append("  [2. XÁC ĐỊNH TRẠNG THÁI CỔ PHIẾU]")
+    lines.append(f"  • Trạng thái : {state.replace('_', ' ')}")
+    lines.append(f"  • Vùng giá   : {val.get('position', 'N/A')}")
+    state_desc = {
+        "STRONG_UPTREND": "Dòng tiền áp đảo, xu hướng và xung lực đều chuẩn mực.",
+        "UPTREND": "Uptrend sóng ngắn, đang hướng lên nhưng cần tích lũy thêm.",
+        "SIDEWAY": "Giá đang tích lũy hoặc kẹp giữa các vùng EMA/Cloud.",
+        "DOWNTREND": "Rơi tự do, mọi chỉ báo đều gãy, rủi ro cực cao."
+    }
+    lines.append(f"  • Nhận định  : {state_desc.get(state, 'Chưa xác định rõ xu hướng.')}")
     lines.append("")
-    
-    # --- 3. VSA & RECENT EFFORT ---
-    lines.append("  [3. VSA & PRICE ACTION - DIỄN BIẾN DÒNG TIỀN]")
-    vsa_dom = vsa['dominant'].upper()
-    vsa_signals = vsa.get("signals", [])
-    
-    if vsa_signals:
-        sig_str = ", ".join([s['type'].replace('_', ' ').title() for s in vsa_signals])
-        lines.append(f"  • Các nỗ lực gần đây    : Xuất hiện các cột {sig_str}")
-    else:
-        lines.append("  • Các nỗ lực gần đây    : Không ghi nhận hành vi đẩy giá / xả hàng bất thường nào.")
-        
-    if vsa_dom == 'BULLISH':
-        vsa_eval = "DÒNG TIỀN ỦNG HỘ TĂNG (Phe mua đang kiểm soát, lực cầu lớn hơn cung)"
-    elif vsa_dom == 'BEARISH':
-        vsa_eval = "CHỊU ÁP LỰC BÁN (Rủi ro phân phối xả hàng, lực cung lớn hơn cầu)"
-    else:
-        if accum['is_accumulation']:
-            vsa_eval = "CẠN KIỆT ĐI NGANG (Cổ phiếu đang siết nền cực chặt, biên độ hẹp, chờ nổ)"
-        else:
-            vsa_eval = "CÂN BẰNG (Chưa có dòng tiền lớn khổng lồ nào vào dẫn dắt)"
-            
-    lines.append(f"  => Đánh giá chung: Trạng thái dòng tiền hiện tại mang tính {vsa_eval}.")
+
+    # --- 2.1 TÍCH LŨY NỀN (ACCUMULATION) ---
+    accum = result.get("accum", {})
+    if accum.get("is_accumulation"):
+        lines.append("  [2.1 TÍCH LŨY NỀN - CONSOLIDATION]")
+        lines.append(f"  • Trạng thái : ĐANG TÍCH LŨY ({accum.get('base_quality', 'MEDIUM')})")
+        if accum.get("notes"):
+            lines.append(f"  • Ghi chú    : {', '.join(accum['notes'])}")
+        if accum.get("ready_to_break"):
+            lines.append("  🔥 CẢNH BÁO : Nền siết chặt, sẵn sàng bùng nổ (Breakout Ready)!")
+        lines.append("")
+
+    # --- 3. MỨC GIÁ QUAN TRỌNG ---
+    lines.append("  [3. MỨC GIÁ QUAN TRỌNG - S/R]")
+    lines.append(f"  • Giá hiện tại: {price:,.2f}")
+    lines.append(f"  • Hỗ trợ (S): S1: {s1:,.2f} | S2: {s2:,.2f}")
+    lines.append(f"  • Kháng cự (R): R1: {r1:,.2f} | R2: {r2:,.2f}")
     lines.append("")
-    
-    # --- 4. KẾT LUẬN & HÀNH ĐỘNG ---
+
+    # --- 4. HÀNH ĐỘNG (ACTIONABLE) ---
     lines.append(sep2)
-    lines.append("  [4. ĐÁNH GIÁ TỔNG QUAN & HÀNH ĐỘNG]")
+    lines.append("  [4. HÀNH ĐỘNG - KẾ HOẠCH GIAO DỊCH]")
+    lines.append(f"  • Điểm mua Breakout : {bb:,.2f} (Vượt R1 + 1%)")
+    lines.append(f"  • Chốt lãi 1 (TP1)   : {tp1:,.2f} (Vùng R1 - 2%)")
+    lines.append(f"  • Chốt lãi 2 (TP2)   : {tp2:,.2f} (Vùng R2 - 2%)")
+    lines.append(f"  • Chặn lãi (TS)      : {ts:,.2f} (Cập nhật theo MA20/Tenkan)")
+    lines.append(f"  • Cắt lỗ 1 (SL1)     : {sl1:,.2f} (Thủng S1 - 1%)")
+    lines.append(f"  • Cắt lỗ 2 (SL2)     : {sl2:,.2f} (Thủng S2 - 3%)")
+    lines.append("")
+
+    # --- 5. RỦI RO ---
+    lines.append("  [5. RỦI RO & QUẢN TRỊ VỐN]")
+    lines.append(f"  • Risk Score : {rs}/100")
+    lines.append(f"  • Đánh giá   : {rd.upper()}")
+    lines.append(f"  • Tỷ lệ R/R   : {rr} (Lợi nhuận: +{val.get('reward_pct', 0)}% / Rủi ro: -{val.get('risk_pct', 0)}%)")
+    if val.get("fomo_warning"):
+        lines.append("  ⚠️ CẢNH BÁO  : GIÁ ĐANG CÁCH QUÁ XA MA20 (>12%) - FOMO CAO!")
+    lines.append("")
+
+    # --- 6. KẾT LUẬN ---
+    lines.append(sep2)
+    lines.append("  [6. KẾT LUẬN CUỐI CÙNG]")
+    lines.append(f"  • CÓ NÊN THAM GIA: {action.upper()}")
     
-    # Tổng hợp trạng thái
-    if ma_trend['is_perfect_uptrend'] and vsa_dom == 'BULLISH':
-        overall_state = "CỔ PHIẾU ĐANG TĂNG MẠNH (Dòng tiền áp đảo, xu hướng chuẩn mực)."
-    elif close < ma20 and close < ma50 and ichi['price_vs_kumo'] == 'below':
-        overall_state = "CỔ PHIẾU ĐANG GIẢM MẠNH (Rơi tự do, mọi chỉ báo đều gãy)."
-    elif accum['is_accumulation']:
-        overall_state = "CỔ PHIẾU ĐANG TÍCH LŨY MẠNH NHƯ LÒ XO BỊ NÉN."
-    elif close > ma20:
-        overall_state = "CỔ PHIẾU ĐANG HƯỚNG LÊN TỪ TỪ (Uptrend sóng ngắn)."
+    # Reason construction
+    reason = f"Cổ phiếu đang {state.replace('_', ' ')}."
+    if action.startswith("YES"):
+        reason += f" Có điểm mua [{adv.get('entry_type', 'N/A')}] đi kèm tỷ lệ R/R tốt."
+    elif action.startswith("WAIT"):
+        reason += " Cần chờ giá điều chỉnh về vùng hỗ trợ hoặc tích lũy thêm để cải thiện R/R."
     else:
-        overall_state = "CỔ PHIẾU ĐANG GIAO DỊCH LÌNH XÌNH, KHÔNG CÓ XU HƯỚNG RÕ RÀNG."
+        reason += " Xu hướng quá yếu, không an toàn để giải ngân."
         
-    lines.append(f"  • Trạng thái chung: {overall_state}")
-    
-    # Khuyến nghị giao dịch
-    entry = adv['entry_type']
-    if entry != "NONE":
-        lines.append(f"  • Khuyến nghị     : 🔥 ĐIỂM MUA  [{entry.replace('_', ' ')}] 🔥")
-        lines.append(f"    - Mức độ tự tin : {adv['confidence']}")
-        lines.append(f"    - Tỷ trọng g/ngân: {adv['position_size']}")
-    else:
-        if close > ma20:
-            lines.append("  • Khuyến nghị     : TIẾP TỤC NẮM GIỮ (Hold) / Không nên mua đuổi lúc này.")
-        elif accum['is_accumulation']:
-            lines.append("  • Khuyến nghị     : CHỜ MUA (Wait & See) / Sẵn sàng giải ngân thăm dò khi bật nền.")
-        else:
-            lines.append("  • Khuyến nghị     : QUAN SÁT / CÂN NHẮC CẮT LỖ nếu vi phạm ngưỡng hỗ trợ.")
-            
-    if adv['risk_flags']:
-        lines.append(f"  • Cảnh báo rủi ro : {', '.join(adv['risk_flags'])}")
-        
+    lines.append(f"  • Lý do          : {reason}")
     lines.append(sep)
     lines.append("")
-    
+
     return "\n".join(lines)

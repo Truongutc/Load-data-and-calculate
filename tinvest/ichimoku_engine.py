@@ -41,6 +41,8 @@ def compute_ichimoku(df: pd.DataFrame) -> pd.DataFrame:
         out["Tenkan"] = _donchian_mid(out["High"], out["Low"], 9)
     if "Kijun" not in out.columns:
         out["Kijun"]  = _donchian_mid(out["High"], out["Low"], 26)
+    if "Kijun65" not in out.columns:
+        out["Kijun65"] = _donchian_mid(out["High"], out["Low"], 65)
 
     if "SpanA" not in out.columns:
         out["SpanA"]  = ((out["Tenkan"] + out["Kijun"]) / 2).shift(26)
@@ -48,6 +50,11 @@ def compute_ichimoku(df: pd.DataFrame) -> pd.DataFrame:
         out["SpanB"]  = _donchian_mid(out["High"], out["Low"], 52).shift(26)
     if "Chikou" not in out.columns:
         out["Chikou"] = out["Close"].shift(-26)
+
+    if "CloudTop" not in out.columns:
+        out["CloudTop"] = out[["SpanA", "SpanB"]].max(axis=1)
+    if "CloudBottom" not in out.columns:
+        out["CloudBottom"] = out[["SpanA", "SpanB"]].min(axis=1)
 
     return out
 
@@ -151,6 +158,12 @@ def analyze_ichimoku(df: pd.DataFrame) -> dict:
         "kijun_slope":        kijun_slope,
         "tenkan_kijun_cross": tk_cross,
         "score":              score,
+        "kijun":              float(last["Kijun"]),
+        "kijun65":            float(last["Kijun65"]),
+        "span_a":             float(span_a) if not pd.isna(span_a) else 0,
+        "span_b":             float(span_b) if not pd.isna(span_b) else 0,
+        "cloud_top":          float(max(span_a, span_b)) if not (pd.isna(span_a) or pd.isna(span_b)) else 0,
+        "cloud_bottom":       float(min(span_a, span_b)) if not (pd.isna(span_a) or pd.isna(span_b)) else 0,
     }
     logger.debug(f"Ichimoku result: {result}")
     return result

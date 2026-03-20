@@ -13,45 +13,49 @@ def analyze_accumulation(df: pd.DataFrame) -> dict:
     close = last['Close']
     
     # 1. Biên độ giá thu hẹp
-    price_tight = ((hh20 - ll20) / close) < 0.15
+    # HIGH: < 7%, MEDIUM: < 12%
+    price_range = (hh20 - ll20) / close
+    price_tight = price_range < 0.12
     
     # 2. Volume giảm
     vol_sma10 = df['Volume'].rolling(10).mean().iloc[-1]
     vol_sma20 = df['Volume'].rolling(20).mean().iloc[-1]
-    vol_drying = vol_sma10 < vol_sma20
+    vol_avg_low = vol_sma10 < vol_sma20 * 1.3
     
-    # 3. Giá giữ trên MA20
+    # 3. Giá giữ quanh MA20
     ma20 = df['Close'].rolling(20).mean().iloc[-1]
-    above_ma20 = close >= ma20
+    near_ma20 = close >= ma20 * 0.98 # Allow 2% dip for sideway
     
-    # 4. Có tín hiệu VSA (No Supply or Test Supply)
-    open_c = last['Open']
-    vol = last['Volume']
-    spread = last['High'] - last['Low']
+    # 4. Có tín hiệu VSA trong 7 phiên (window rộng hơn)
+    def check_vsa_at(d, i):
+        if abs(i) >= len(d): return False
+        c, o, v = d['Close'].iloc[i], d['Open'].iloc[i], d['Volume'].iloc[i]
+        s = d['High'].iloc[i] - d['Low'].iloc[i]
+        vs20 = d['Volume'].rolling(20).mean().iloc[i]
+        as20 = (d['High'] - d['Low']).rolling(20).mean().iloc[i]
+        if pd.isna(vs20) or pd.isna(as20): return False
+        
+        no_s = (c < o) and (v < vs20) and (s < as20)
+        ts_s = (c < o) and (s < as20) and (v < d['Volume'].iloc[i-1]) and (v < d['Volume'].iloc[i-2])
+        return no_s or ts_s
+
+    vsa_recently = any([check_vsa_at(df, -1-i) for i in range(7)])
     
-    avg_spread_20 = (df['High'] - df['Low']).rolling(20).mean().iloc[-1]
-    is_down = close < open_c
-    
-    # No Supply
-    no_supply = is_down and (vol < vol_sma20) and (spread < avg_spread_20)
-    
-    # Test Supply
-    prev_vol = df['Volume'].iloc[-2]
-    prev2_vol = df['Volume'].iloc[-3]
-    test_supply = is_down and (spread < avg_spread_20) and (vol < prev_vol) and (vol < prev2_vol)
-    
-    vsa_signal = no_supply or test_supply
-    
-    is_accum = price_tight and vol_drying and above_ma20 and vsa_signal
+    # Logic: Tích nền = Biên độ hẹp + Volume thấp + Giữ được vùng giá (Above S1/MA20)
+    is_accum = price_tight and vol_avg_low and near_ma20
     
     notes = []
-    if price_tight: notes.append("Biên độ hẹp")
-    if vol_drying: notes.append("Volume cạn")
-    if vsa_signal: notes.append("Tín hiệu cạn cung (No/Test Supply)")
+    if price_range < 0.07: notes.append("Nền thắt chặt (Tight Base <7%)")
+    elif price_tight: notes.append("Biên độ bắt đầu thu hẹp (<12%)")
+    if vol_avg_low: notes.append("Áp lực bán cạn kiệt (Volume low)")
+    if vsa_recently: notes.append("Xuất hiện điểm cạn cung (No/Test Supply)")
     
+    quality = "HIGH" if (is_accum and vsa_recently and price_range < 0.08) else "MEDIUM"
+
     return {
         "is_accumulation": is_accum,
-        "base_quality": "HIGH" if is_accum else "MEDIUM",
-        "ready_to_break": is_accum and (close > ma20),
-        "notes": notes
+        "base_quality": quality,
+        "ready_to_break": is_accum and (close > ma20) and vsa_recently,
+        "notes": notes,
+        "range_pct": round(price_range * 100, 2)
     }

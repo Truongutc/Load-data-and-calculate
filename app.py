@@ -1,6 +1,6 @@
 """
-TINVEST Desktop App
-Giao diện người dùng cho hệ thống phân tích TINVEST
+AIC code = AI + cơm! Desktop App
+Giao diện người dùng cho hệ thống phân tích AIC code = AI + cơm!
 """
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -14,7 +14,7 @@ import threading
 class TinvestApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("TINVEST - Hệ thống Phân tích Chứng khoán")
+        self.root.title("AIC code = AI + cơm! - Hệ thống Phân tích Chứng khoán")
         self.root.geometry("850x650")
         
         self.data_dict = {}
@@ -189,6 +189,7 @@ class TinvestApp:
             from tinvest.advanced_entry import classify_entry
             from tinvest.accumulation_engine import analyze_accumulation
             from tinvest.ma_engine import analyze_ma_trend
+            from tinvest.risk_engine import calculate_stoploss
             from concurrent.futures import ThreadPoolExecutor
 
             total_compute = len(self.data_dict)
@@ -216,6 +217,7 @@ class TinvestApp:
                     adv = classify_entry(df_rich)
                     accum = analyze_accumulation(df_rich)
                     ma_trend = analyze_ma_trend(df_rich)
+                    risk = calculate_stoploss(df_rich, adv["entry_type"], float(df_sub["Close"].iloc[-1]), adv.get("details"))
                     
                     return ticker, {
                         "df": df_sub,
@@ -225,7 +227,8 @@ class TinvestApp:
                         "score": score,
                         "adv": adv,
                         "accum": accum,
-                        "ma_trend": ma_trend
+                        "ma_trend": ma_trend,
+                        "risk": risk
                     }
                 except Exception:
                     return ticker, None
@@ -392,11 +395,16 @@ class TinvestApp:
                         flags = ", ".join(res["risk_flags"]) if res["risk_flags"] else "None"
                         
                 if match:
+                    risk = data.get("risk", {})
+                    if not risk.get("is_valid", True):
+                        continue # Skip high risk signals (>10%)
+                        
                     results.append({
                         "Ticker": ticker,
-                        "Price": round(float(df["Close"].iloc[-1]), 2),
-                        "Avg Vol": f"{int(avg_vol_20):,}",
-                        "Size": size,
+                        "Entry": risk.get("entry_price", 0),
+                        "SL": risk.get("sl_price", 0),
+                        "Target": risk.get("tp_price", 0),
+                        "Risk%": f"{risk.get('risk_pct', 0)}%",
                         "Confidence/Quality": conf,
                         "Notes/Risks": flags
                     })
