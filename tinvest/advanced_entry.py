@@ -18,42 +18,49 @@ def classify_entry(df: pd.DataFrame) -> dict:
         
     df = df.copy()
     
-    # --- INDICATORS ---
+    # --- INDICATORS (Optimized: only calculate if missing) ---
     # MA
-    df['MA10'] = df['Close'].rolling(10).mean()
-    df['MA20'] = df['Close'].rolling(20).mean()
-    df['MA50'] = df['Close'].rolling(50).mean()
-    df['MA100'] = df['Close'].rolling(100).mean()
-    df['MA200'] = df['Close'].rolling(200).mean()
+    if 'MA10' not in df.columns: df['MA10'] = df['Close'].rolling(10).mean()
+    if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
+    if 'MA50' not in df.columns: df['MA50'] = df['Close'].rolling(50).mean()
+    if 'MA100' not in df.columns: df['MA100'] = df['Close'].rolling(100).mean()
+    if 'MA200' not in df.columns: df['MA200'] = df['Close'].rolling(200).mean()
     
     # Ichimoku
-    high_9 = df['High'].rolling(9).max()
-    low_9 = df['Low'].rolling(9).min()
-    df['Tenkan'] = (high_9 + low_9) / 2
+    if 'Tenkan' not in df.columns:
+        high_9 = df['High'].rolling(9).max()
+        low_9 = df['Low'].rolling(9).min()
+        df['Tenkan'] = (high_9 + low_9) / 2
     
-    high_26 = df['High'].rolling(26).max()
-    low_26 = df['Low'].rolling(26).min()
-    df['Kijun'] = (high_26 + low_26) / 2
+    if 'Kijun' not in df.columns:
+        high_26 = df['High'].rolling(26).max()
+        low_26 = df['Low'].rolling(26).min()
+        df['Kijun'] = (high_26 + low_26) / 2
     
-    df['SpanA'] = ((df['Tenkan'] + df['Kijun']) / 2).shift(26)
+    if 'SpanA' not in df.columns:
+        df['SpanA'] = ((df['Tenkan'] + df['Kijun']) / 2).shift(26)
     
-    high_52 = df['High'].rolling(52).max()
-    low_52 = df['Low'].rolling(52).min()
-    df['SpanB'] = ((high_52 + low_52) / 2).shift(26)
+    if 'SpanB' not in df.columns:
+        high_52 = df['High'].rolling(52).max()
+        low_52 = df['Low'].rolling(52).min()
+        df['SpanB'] = ((high_52 + low_52) / 2).shift(26)
     
-    df['CloudTop'] = df[['SpanA', 'SpanB']].max(axis=1)
-    df['CloudBottom'] = df[['SpanA', 'SpanB']].min(axis=1)
+    if 'CloudTop' not in df.columns:
+        df['CloudTop'] = df[['SpanA', 'SpanB']].max(axis=1)
+    if 'CloudBottom' not in df.columns:
+        df['CloudBottom'] = df[['SpanA', 'SpanB']].min(axis=1)
     
     # Heikin Ashi
-    df_ha = calculate_ha(df)
-    df['HA_Open'] = df_ha['HA_Open']
-    df['HA_Close'] = df_ha['HA_Close']
-    df['HA_Color'] = np.where(df['HA_Close'] > df['HA_Open'], 'Green', 'Red')
+    if 'HA_Close' not in df.columns:
+        df_ha = calculate_ha(df)
+        df['HA_Open'] = df_ha['HA_Open']
+        df['HA_Close'] = df_ha['HA_Close']
+        df['HA_Color'] = np.where(df['HA_Close'] > df['HA_Open'], 'Green', 'Red')
     
     # VSA Proxy
-    df['Spread'] = df['High'] - df['Low']
-    df['AvgVolume20'] = df['Volume'].rolling(20).mean()
-    df['Avg_Spread_20'] = df['Spread'].rolling(20).mean()
+    if 'Spread' not in df.columns: df['Spread'] = df['High'] - df['Low']
+    if 'AvgVolume20' not in df.columns: df['AvgVolume20'] = df['Volume'].rolling(20).mean()
+    if 'Avg_Spread_20' not in df.columns: df['Avg_Spread_20'] = df['Spread'].rolling(20).mean()
     
     # VSA Rules
     df['Stopping_Vol'] = (df['Volume'] > 1.5 * df['AvgVolume20']) & (df['Spread'] > df['Avg_Spread_20']) & (df['Close'] >= df['Low'] + 0.7 * df['Spread'])

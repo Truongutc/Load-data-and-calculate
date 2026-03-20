@@ -189,23 +189,36 @@ class TinvestApp:
             from tinvest.advanced_entry import classify_entry
             from tinvest.accumulation_engine import analyze_accumulation
             from tinvest.ma_engine import analyze_ma_trend
-            
+            from concurrent.futures import ThreadPoolExecutor
+
             total_compute = len(self.data_dict)
-            cmp = 0
-            
             self.analysis_cache = {}
-            for ticker, df in self.data_dict.items():
+            
+            # --- 5.1 CHIA NHỎ CÔNG ĐOẠN: Tính toán đa luồng (Optimized) ---
+            def _analyze_single(ticker_df_tuple):
+                ticker, df_sub = ticker_df_tuple
                 try:
-                    ichi = analyze_ichimoku(df)
-                    vsa = analyze_vsa(df)
-                    aic = analyze_aic(df)
-                    score = calculate_score(ichi, vsa, aic)
-                    adv = classify_entry(df)
-                    accum = analyze_accumulation(df)
-                    ma_trend = analyze_ma_trend(df)
+                    # 1. Pre-calculate common indicators to share across engines
+                    from tinvest.ichimoku_engine import compute_ichimoku
+                    df_rich = compute_ichimoku(df_sub)
                     
-                    self.analysis_cache[ticker] = {
-                        "df": df,
+                    df_rich['MA10'] = df_rich['Close'].rolling(10).mean()
+                    df_rich['MA20'] = df_rich['Close'].rolling(20).mean()
+                    df_rich['MA50'] = df_rich['Close'].rolling(50).mean()
+                    df_rich['MA100'] = df_rich['Close'].rolling(100).mean()
+                    df_rich['MA200'] = df_rich['Close'].rolling(200).mean()
+                    
+                    # 2. Call engines using the enriched DataFrame
+                    ichi = analyze_ichimoku(df_rich)
+                    vsa = analyze_vsa(df_rich)
+                    aic = analyze_aic(df_rich)
+                    score = calculate_score(ichi, vsa, aic)
+                    adv = classify_entry(df_rich)
+                    accum = analyze_accumulation(df_rich)
+                    ma_trend = analyze_ma_trend(df_rich)
+                    
+                    return ticker, {
+                        "df": df_sub,
                         "ichi": ichi,
                         "vsa": vsa,
                         "aic": aic,
@@ -214,12 +227,25 @@ class TinvestApp:
                         "accum": accum,
                         "ma_trend": ma_trend
                     }
-                except Exception as ex:
-                    pass
+                except Exception:
+                    return ticker, None
+
+            self.log_sync(f"[5/5] CẤU TRÚC LẠI DỮ LIỆU... Đang chạy song song {total_compute} mã (Tốc độ cao)...")
+            
+            cmp = 0
+            # Sử dụng ThreadPoolExecutor để tận dụng CPU (Pandas/Numpy release GIL)
+            # Max workers có thể để None (mặc định) hoặc giới hạn ví dụ 10-20
+            with ThreadPoolExecutor(max_workers=None) as executor:
+                results = executor.map(_analyze_single, self.data_dict.items())
                 
-                cmp += 1
-                if cmp % 100 == 0:
-                    self.log_sync(f" ---> Đã tính toán xong {cmp}/{total_compute} mã...")
+                for ticker, res in results:
+                    if res:
+                        self.analysis_cache[ticker] = res
+                    
+                    cmp += 1
+                    # Cập nhật log thường xuyên hơn (mỗi 20 mã hoặc 5%) để tránh cảm giác bị treo
+                    if cmp % 20 == 0 or cmp == total_compute:
+                        self.log_sync(f" ---> Tiến độ: {cmp}/{total_compute} mã ({int(cmp/total_compute*100)}%)...")
 
             self.log_sync("[6/6] Đang phân tích Market Breadth (Độ Rộng Thị Trường)...")
             breadth_dfs = []

@@ -95,8 +95,7 @@ class TestAnalyzer:
 
     def test_analyze_stock_keys(self, sample_df):
         result = analyze_stock("TEST", sample_df)
-        for key in ("ticker", "price", "date", "trend", "money", "trigger",
-                    "score", "classification", "opportunity", "risk"):
+        for key in ("ticker", "price", "date", "ichi", "vsa", "ma_trend", "adv", "accum"):
             assert key in result
 
     def test_format_report_is_string(self, sample_df):
@@ -104,7 +103,7 @@ class TestAnalyzer:
         report  = format_report(result)
         assert isinstance(report, str)
         assert "TEST" in report
-        assert "ĐIỂM TỔNG" in report
+        assert "BÁO CÁO PHÂN TÍCH TỔNG HỢP" in report
 
     def test_ticker_normalized_to_upper(self, sample_df):
         result = analyze_stock("test", sample_df)

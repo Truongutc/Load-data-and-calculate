@@ -4,11 +4,11 @@ def analyze_ma_trend(df: pd.DataFrame) -> dict:
     if len(df) < 200:
         return {"is_perfect_uptrend": False}
         
-    ma10 = df['Close'].rolling(10).mean()
-    ma20 = df['Close'].rolling(20).mean()
-    ma50 = df['Close'].rolling(50).mean()
-    ma100 = df['Close'].rolling(100).mean()
-    ma200 = df['Close'].rolling(200).mean()
+    ma10 = df['MA10'] if 'MA10' in df.columns else df['Close'].rolling(10).mean()
+    ma20 = df['MA20'] if 'MA20' in df.columns else df['Close'].rolling(20).mean()
+    ma50 = df['MA50'] if 'MA50' in df.columns else df['Close'].rolling(50).mean()
+    ma100 = df['MA100'] if 'MA100' in df.columns else df['Close'].rolling(100).mean()
+    ma200 = df['MA200'] if 'MA200' in df.columns else df['Close'].rolling(200).mean()
     
     last = df.iloc[-1]
     prev = df.iloc[-2]

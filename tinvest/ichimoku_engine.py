@@ -33,22 +33,21 @@ def _donchian_mid(series_high: pd.Series, series_low: pd.Series, period: int) ->
 def compute_ichimoku(df: pd.DataFrame) -> pd.DataFrame:
     """
     Append Ichimoku columns to a copy of df and return it.
-
-    Added columns
-    -------------
-    Tenkan, Kijun, SpanA, SpanB, Chikou
+    Optimized: only calculates missing columns.
     """
     out = df.copy()
 
-    out["Tenkan"] = _donchian_mid(out["High"], out["Low"], 9)
-    out["Kijun"]  = _donchian_mid(out["High"], out["Low"], 26)
+    if "Tenkan" not in out.columns:
+        out["Tenkan"] = _donchian_mid(out["High"], out["Low"], 9)
+    if "Kijun" not in out.columns:
+        out["Kijun"]  = _donchian_mid(out["High"], out["Low"], 26)
 
-    # Senkou Span A & B are projected 26 bars **forward** (standard).
-    # For analysis we want to compare current price against the cloud that
-    # was drawn *26 bars ago*, i.e. we shift back 26 periods.
-    out["SpanA"]  = ((out["Tenkan"] + out["Kijun"]) / 2).shift(26)
-    out["SpanB"]  = _donchian_mid(out["High"], out["Low"], 52).shift(26)
-    out["Chikou"] = out["Close"].shift(-26)
+    if "SpanA" not in out.columns:
+        out["SpanA"]  = ((out["Tenkan"] + out["Kijun"]) / 2).shift(26)
+    if "SpanB" not in out.columns:
+        out["SpanB"]  = _donchian_mid(out["High"], out["Low"], 52).shift(26)
+    if "Chikou" not in out.columns:
+        out["Chikou"] = out["Close"].shift(-26)
 
     return out
 

@@ -19,11 +19,23 @@ logger = logging.getLogger(__name__)
 def analyze_stock(ticker: str, df: pd.DataFrame) -> dict:
     logger.info(f"Analyzing {ticker} ...")
     
-    ichi = analyze_ichimoku(df)
-    vsa = analyze_vsa(df)
-    ma_trend = analyze_ma_trend(df)
-    adv = classify_entry(df)
-    accum = analyze_accumulation(df)
+    # 1. Pre-calculate common indicators to share across engines
+    from .ichimoku_engine import compute_ichimoku
+    df_rich = compute_ichimoku(df)
+    
+    if 'MA10' not in df_rich.columns:
+        df_rich['MA10'] = df_rich['Close'].rolling(10).mean()
+        df_rich['MA20'] = df_rich['Close'].rolling(20).mean()
+        df_rich['MA50'] = df_rich['Close'].rolling(50).mean()
+        df_rich['MA100'] = df_rich['Close'].rolling(100).mean()
+        df_rich['MA200'] = df_rich['Close'].rolling(200).mean()
+    
+    # 2. Call engines using the enriched DataFrame
+    ichi = analyze_ichimoku(df_rich)
+    vsa = analyze_vsa(df_rich)
+    ma_trend = analyze_ma_trend(df_rich)
+    adv = classify_entry(df_rich)
+    accum = analyze_accumulation(df_rich)
     
     last = df.iloc[-1]
     
