@@ -14,6 +14,7 @@ def _get_indicators(df: pd.DataFrame) -> dict:
     last = df.iloc[-1]
     return {
         "price": float(last['Close']),
+        "ma10": float(last.get('MA10', df['Close'].rolling(10).mean().iloc[-1])),
         "ma20": float(last['MA20']),
         "ma50": float(last['MA50']),
         "tenkan": float(last['Tenkan']),
@@ -73,48 +74,195 @@ def _determine_state(p: float, inds: dict) -> str:
     if is_downtrend: return "DOWNTREND"
     return "SIDEWAY"
 
-def _calculate_sr_adaptive(price: float, inds: dict, levels: dict, pos: str) -> dict:
-    # Default Indicator Support
-    # Rule: Indicator only valid if Price > Indicator
-    def valid_support(val, p): return val if p > val else 0
-    
-    s_ma20 = valid_support(inds["ma20"], price)
-    s_tk = valid_support(inds["tenkan"], price)
-    s_kj65 = valid_support(inds["k65"], price)
-    
-    # S1 (Near): If passed EarlyBuy, S1 = EarlyBuy or Base Low
-    if "Vượt điểm" in pos:
-        # User requirement: Cutloss at Base Bottom or breaking EarlyBuy
-        s1 = max(levels["EARLY"], inds["low10"]) if levels["EARLY"] > 0 else max(s_ma20, s_tk)
-    else:
-        s1 = max(s_ma20, s_tk, inds["low10"])
-        
-    if s1 == 0 or s1 > price: s1 = price * 0.95 # Fallback
-    
-    # S2 (Deep): Base Low or deep indicators
-    s2 = min(inds["low20"], inds["ma50"] if inds["ma50"] < s1 else s1 * 0.95)
-    if s2 > s1: s2 = s1 * 0.95
-    
-    # R1 (Target): min(HH10, Price * 1.10)
-    r1 = min(inds["hh10"] if inds["hh10"] > price else price * 1.08, price * 1.10)
-    if r1 <= price: r1 = price * 1.05 # Ensure R1 > Price
-    
-    # R2 (Further): Price * 1.15
-    r2 = max(price * 1.15, r1 * 1.05)
-    
-    return {"s1": s1, "s2": s2, "r1": r1, "r2": r2}
+def _get_nearest_peak(df, idx=None, lookback=10):
+    if idx is None: idx = -1
+    if len(df) < lookback: return float(df['High'].max())
+    return float(df['High'].iloc[-lookback:].max())
 
-def _calculate_buffers(price: float, sr: dict, ma20: float, tenkan: float) -> dict:
+def _get_nearest_valley(df, idx=None, lookback=10):
+    if idx is None: idx = -1
+    if len(df) < lookback: return float(df['Low'].min())
+    return float(df['Low'].iloc[-lookback:].min())
+
+def _get_second_nearest_peak(df, idx=None, lookback1=10, lookback2=20):
+    if idx is None: idx = -1
+    if len(df) < lookback2: return _get_nearest_peak(df, idx, lookback1)
+    return float(df['High'].iloc[-lookback2:-lookback1].max())
+
+def _calculate_exits_and_sr(df, inds: dict, entry_info: dict) -> dict:
+    p = inds["price"]
+    entry_type = entry_info.get("entry_type", "NONE")
+    source = entry_info.get("details", {}).get("source", "UNKNOWN")
+    
+    last = df.iloc[-1]
+    
+    nearest_peak = _get_nearest_peak(df, -1, 10)
+    second_peak = _get_second_nearest_peak(df, -1, 10, 20)
+    if second_peak < p: second_peak = nearest_peak * 1.05
+    nearest_valley = _get_nearest_valley(df, -1, 10)
+    short_term_valley = _get_nearest_valley(df, -1, 5)
+    
+    ma10 = inds['ma10']
+    ma20 = inds['ma20']
+    ma50 = inds['ma50']
+    tk = inds['tenkan']
+    kj = inds['kijun']
+    k65 = inds['k65']
+    cloud_top = inds['cloud_top']
+    cloud_bottom = min(inds['span_a'], inds['span_b'])
+    price_above_cloud = p > cloud_top
+    price_below_cloud = p < cloud_bottom
+    
+    # Defaults
+    r1, r2, s1, s2 = p * 1.05, p * 1.10, p * 0.95, p * 0.90
+    tp, ts, sl, sell_all = p * 1.05, p * 0.95, p * 0.95, p * 0.90
+    
+    if entry_type == "EARLY":
+        if source == "MA":
+            r1 = min(p * 1.15, nearest_peak) if p * 1.15 < nearest_peak or nearest_peak < p else nearest_peak
+            r2 = max(p * 1.15, nearest_peak)
+            s1 = max(nearest_valley, ma10)
+            s2 = min(nearest_valley, ma10)
+            tp = r1
+            ts = ma10
+            sl = max(p * 0.90, ma10, nearest_valley)
+            sell_all = min(p * 0.90, ma10, nearest_valley)
+            
+        elif source == "ICHIMOKU":
+            if price_below_cloud:
+                r1 = min(kj, k65)
+                r2 = max(kj, k65)
+                s1 = max(tk, nearest_valley)
+                s2 = min(tk, nearest_valley)
+                tp = r1
+                ts = min(r1 * 0.97, p * 1.10)
+                sl = max(tk, nearest_valley, p * 0.90)
+                sell_all = short_term_valley * 0.98
+            else: # trên mây
+                r1 = min(kj, nearest_peak)
+                r2 = max(kj, nearest_peak)
+                s1 = max(k65, tk)
+                s2 = min(k65, tk)
+                tp = r1
+                ts = min(r1 * 0.97, p * 1.10)
+                sl = s1 * 0.97
+                sell_all = cloud_top if p > cloud_top else cloud_bottom
+        else: # VSA or fallback
+            r1 = nearest_peak
+            r2 = second_peak
+            s1 = ma20
+            s2 = ma50
+            tp = r1
+            ts = max(ma20, p * 0.95)
+            sl = nearest_valley
+            sell_all = nearest_valley * 0.95
+
+    elif entry_type in ["ADD_1", "ADD_2"]:
+        if source == "MA_PULLBACK":
+            r1 = nearest_peak
+            r2 = second_peak
+            s1 = ma20
+            s2 = ma50
+            tp = r1
+            ts = min(p * 1.10, r1)
+            sl = ma20 * 0.97
+            sell_all = ma50 * 0.97
+        elif source == "MA_CROSS" or source == "MA":
+            r1 = nearest_peak
+            r2 = second_peak
+            s1 = ma20
+            s2 = ma50
+            tp = r1
+            ts = min(p * 1.10, r1)
+            if p < kj: ts = min(ts, kj)
+            sl = ma20 * 0.97
+            sell_all = ma50 * 0.97
+        elif source == "ICHIMOKU":
+            if price_below_cloud:
+                r1 = min(k65, cloud_top, nearest_peak)
+                r2 = min(nearest_peak, cloud_top)
+                s1 = tk
+                s2 = kj
+                tp = r1
+                ts = min(p * 1.10, r1)
+                sl = max(s1 * 0.97, p * 0.90)
+                sell_all = kj * 0.95
+            else: # Trên mây
+                r1 = nearest_peak
+                r2 = second_peak
+                s1 = max(k65 if k65 < p else 0, tk)
+                s2_candidates = [v for v in (k65 if k65 < p else float('inf'), ma20, kj) if v > 0]
+                s2 = min(s2_candidates) if s2_candidates else min(ma20, kj)
+                tp = r1
+                ts = min(r1 * 0.97, p * 1.10)
+                sl = s1 * 0.97
+                sell_all = cloud_top if p > cloud_top else cloud_bottom
+        else:
+            r1 = nearest_peak
+            r2 = second_peak
+            s1 = ma20
+            s2 = ma50
+            tp = r1
+            ts = ma20
+            sl = ma20 * 0.97
+            sell_all = ma50 * 0.97
+
+    elif entry_type == "STRONG":
+        if source == "MA":
+            r1 = nearest_peak
+            r2 = second_peak
+            s1 = ma10
+            s2 = ma20
+            tp = max(p * 1.15, r1)
+            ts = min(p * 1.15, r1)
+            sl = min(s1 * 0.95, p * 0.90)
+            sell_all = s2 * 0.97
+        elif source == "ICHIMOKU":
+            r1 = nearest_peak
+            r2 = second_peak
+            s1 = max(k65 if k65 < p else 0, tk)
+            s2_candidates = [val for val in (k65 if k65 < p else float('inf'), ma20, kj) if val > 0]
+            s2 = min(s2_candidates) if s2_candidates else min(ma20, kj)
+            tp = r1
+            ts = min(r1 * 0.97, p * 1.10)
+            sl = s1 * 0.97
+            sell_all = cloud_top if p > cloud_top else cloud_bottom
+        else:
+            r1 = nearest_peak
+            r2 = second_peak
+            s1 = ma10
+            s2 = ma20
+            tp = r1
+            ts = ma10
+            sl = ma10 * 0.95
+            sell_all = ma20 * 0.95
+    else: # NONE hoặc không có tín hiệu
+        r1 = nearest_peak
+        r2 = second_peak
+        s1 = max(ma20, tk)
+        s2 = ma50
+        tp = r1
+        ts = ma20
+        sl = s1 * 0.95
+        sell_all = s2 * 0.95
+
+    # Safe bounds
+    if r1 <= p: r1 = p * 1.05
+    if r2 <= r1: r2 = r1 * 1.05
+    if tp <= p: tp = r1
+    if sl >= p: sl = p * 0.95
+    if sell_all >= sl: sell_all = sl * 0.98
+    
     return {
-        "break_buy": float(sr["r1"] * 1.01),
-        "cutloss_partial": float(sr["s1"] * 0.99),
-        "cutloss_full": float(sr["s2"] * 0.97),
-        "tp1": float(sr["r1"] * 0.98),
-        "tp2": float(sr["r2"] * 0.98),
-        "trailing_stop": float(max(ma20, tenkan))
+        "s1": float(s1), "s2": float(s2), "r1": float(r1), "r2": float(r2),
+        "tp1": float(tp), "tp2": float(r2 * 0.98),
+        "trailing_stop": float(ts),
+        "cutloss_partial": float(sl),
+        "cutloss_full": float(sell_all),
+        "break_buy": float(r1 * 1.01)
     }
 
-def _calculate_risk_score(inds: dict, sr: dict) -> dict:
+def _calculate_risk_score(inds: dict, exits: dict) -> dict:
     p = inds["price"]
     score = 0
     if p < inds["ma20"]: score += 30
@@ -122,9 +270,9 @@ def _calculate_risk_score(inds: dict, sr: dict) -> dict:
     if p < inds["cloud_top"]: score += 20
     if p < inds["k65"]: score += 20
     
-    # User's RR logic: Reward = R1 - P, Risk = P - S1
-    risk_amt = max(0.01, p - sr["s1"])
-    reward_amt = max(0.01, sr["r1"] - p)
+    # User's RR logic: Reward = tp - p, Risk = p - sl (cutloss_partial)
+    risk_amt = max(0.01, p - exits["cutloss_partial"])
+    reward_amt = max(0.01, exits["tp1"] - p)
     
     risk_pct = round((risk_amt / p) * 100, 2)
     reward_pct = round((reward_amt / p) * 100, 2)
@@ -156,14 +304,11 @@ def evaluate_stock_valuation(ticker: str, df: pd.DataFrame, entry_info: dict) ->
     # Step 3: Determine State
     state = _determine_state(price, inds)
     
-    # Step 4: Calculate Adaptive S/R
-    sr = _calculate_sr_adaptive(price, inds, levels, pos)
-    
-    # Step 5: Calculate Buffers
-    buffs = _calculate_buffers(price, sr, inds["ma20"], inds["tenkan"])
+    # Step 4 & 5: Calculate Exits and S/R
+    exits = _calculate_exits_and_sr(df, inds, entry_info)
     
     # Step 6: Risk Scoring
-    risk = _calculate_risk_score(inds, sr)
+    risk = _calculate_risk_score(inds, exits)
     
     # Conclusion
     # If there's an ENTRY TYPE today, action should not be NO unless extreme risk
@@ -188,16 +333,16 @@ def evaluate_stock_valuation(ticker: str, df: pd.DataFrame, entry_info: dict) ->
         "state": state,
         "position": pos,
         "price": price,
-        "s1": float(sr["s1"]),
-        "s2": float(sr["s2"]),
-        "r1": float(sr["r1"]),
-        "r2": float(sr["r2"]),
-        "break_buy": buffs["break_buy"],
-        "cutloss_partial": buffs["cutloss_partial"],
-        "cutloss_full": buffs["cutloss_full"],
-        "tp1": buffs["tp1"],
-        "tp2": buffs["tp2"],
-        "trailing_stop": buffs["trailing_stop"],
+        "s1": exits["s1"],
+        "s2": exits["s2"],
+        "r1": exits["r1"],
+        "r2": exits["r2"],
+        "break_buy": exits["break_buy"],
+        "cutloss_partial": exits["cutloss_partial"],
+        "cutloss_full": exits["cutloss_full"],
+        "tp1": exits["tp1"],
+        "tp2": exits["tp2"],
+        "trailing_stop": exits["trailing_stop"],
         "risk_score": risk["score"],
         "risk_desc": risk["desc"],
         "rr_ratio": risk["rr"],

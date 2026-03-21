@@ -81,6 +81,7 @@ def scan_stocks(data_dict: "dict[str, pd.DataFrame]", min_vol: int = 0) -> pd.Da
             rows.append({
                 "Ticker":         ticker,
                 "Price":          round(last_close, 2),
+                "Volume":         int(df["Volume"].iloc[-1]),
                 "Trend":          ichi["trend"],
                 "MoneyFlow":      vsa["dominant"].capitalize(),
                 "Trigger":        aic["setup"],
@@ -113,7 +114,7 @@ def scan_stocks(data_dict: "dict[str, pd.DataFrame]", min_vol: int = 0) -> pd.Da
     filtered = filtered.sort_values("Score", ascending=False).reset_index(drop=True)
 
     # Public columns only
-    public_cols = ["Ticker", "Price", "Trend", "MoneyFlow", "Trigger", "Score", "Classification", "Action"]
+    public_cols = ["Ticker", "Price", "Volume", "Trend", "MoneyFlow", "Trigger", "Score", "Classification", "Action"]
     logger.info(f"Scan complete: {len(filtered)}/{total} tickers passed Score >= {SCORE_THRESHOLD}")
 
     return filtered[public_cols]
