@@ -22,7 +22,7 @@ from .decision_engine  import analyze_decision
 
 logger = logging.getLogger(__name__)
 
-SCORE_THRESHOLD = 8
+SCORE_THRESHOLD = 5
 
 
 def _action_label(classification: str, aic_setup: str) -> str:
@@ -73,10 +73,11 @@ def scan_stocks(data_dict: "dict[str, pd.DataFrame]", min_vol: int = 0) -> pd.Da
             ichi   = analyze_ichimoku(df)
             vsa    = analyze_vsa(df)
             aic    = analyze_aic(df)
-            score  = calculate_score(ichi, vsa, aic)
+            score  = calculate_score(df, ichi)
             dec    = analyze_decision(df, ichi, vsa, aic)
 
             last_close = float(df["Close"].iloc[-1])
+            setup_label = score.get("details", {}).get("setup", "NONE")
 
             rows.append({
                 "Ticker":         ticker,
@@ -84,14 +85,14 @@ def scan_stocks(data_dict: "dict[str, pd.DataFrame]", min_vol: int = 0) -> pd.Da
                 "Volume":         int(df["Volume"].iloc[-1]),
                 "Trend":          ichi["trend"],
                 "MoneyFlow":      vsa["dominant"].capitalize(),
-                "Trigger":        aic["setup"],
+                "Trigger":        setup_label,
                 "Score":          score["total_score"],
                 "Classification": score["classification"],
-                "Action":         _action_label(score["classification"], aic["setup"]),
+                "Action":         _action_label(score["classification"], setup_label),
                 # Hidden columns for debugging
                 "_ichi_score":    ichi["score"],
-                "_vsa_score":     vsa["score"],
-                "_aic_score":     aic["score"],
+                "_vsa_score":     score["breakdown"]["vsa"],
+                "_aic_score":     score["breakdown"]["aic"],
                 "_opps":          len(dec["opportunity"]),
                 "_risks":         len(dec["risk"]),
             })

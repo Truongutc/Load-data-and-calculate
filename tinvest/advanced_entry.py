@@ -60,11 +60,21 @@ def get_vsa_signals(df, idx):
     return {"stopping": stopping, "no_supply": no_supply, "test_supply": test_supply}
 
 # --- SIGNAL MODULES ---
-def _check_add1_strict(df, idx):
+def _eval_with_cache(cache_key, func, df, idx):
+    if not hasattr(df, 'attrs'): df.attrs = {}
+    if cache_key not in df.attrs: df.attrs[cache_key] = {}
+    if idx in df.attrs[cache_key]: return df.attrs[cache_key][idx]
+    
+    res = func(df, idx)
+    df.attrs[cache_key][idx] = res
+    return res
+
+def _check_add1_strict_impl(df, idx):
     """Refined Add1: Requires EarlyBuy (logic only) in last 30 periods."""
     found_early = False
     for i in range(1, 31):
-        if idx - i < 0: break
+        actual_pos = idx if idx >= 0 else len(df) + idx
+        if actual_pos - i < 0: break
         if _check_early_buy_logic_only(df, idx - i):
             found_early = True
             break
@@ -131,23 +141,30 @@ def _check_add1_strict(df, idx):
     
     return False
 
+def _check_add1_strict(df, idx):
+    return _eval_with_cache('add1_strict', _check_add1_strict_impl, df, idx)
+
 def check_add1(df, idx):
     return _check_add1_strict(df, idx)
 
 def _check_no_recent_signals(df, idx):
-    """Ensure no advanced signals in the last 20 periods."""
+    """Ensure no advanced signals in the last 20 periods without deep recursion."""
     for i in range(1, 21):
-        if idx - i < 0: break
-        res = _eval_day_raw(df, idx - i) 
-        if res and res["type"] in ["ADD_1", "ADD_2", "STRONG"]:
+        actual_pos = idx if idx >= 0 else len(df) + idx
+        if actual_pos - i < 0: break
+        
+        test_idx = idx - i
+        # Query discrete logics directly to bypass recursive wrapper tree
+        if check_strong_buy(df, test_idx) or check_add2(df, test_idx) or _check_add1_strict(df, test_idx):
             return False
+            
     return True
 
 def check_early_buy(df, idx):
     if not _check_no_recent_signals(df, idx): return False
     return _check_early_buy_logic_only(df, idx)
 
-def _check_early_buy_logic_only(df, idx):
+def _check_early_buy_logic_only_impl(df, idx):
     """The technical logic for Early Buy (Refined Cases)."""
     last = df.iloc[idx]
     prev = df.iloc[idx-1]
@@ -184,7 +201,7 @@ def _check_early_buy_logic_only(df, idx):
     tk_up = tk > p_tk
     
     # Nếu giá nằm dưới mây, tenkan < kijun và giá cắt lên trên tenkan, tenkan đang dốc lên HOẶC tenkan cắt lên kijun
-    ichi_below_cloud = price_below_cloud and (tk < kj) and (price_cross_tk and tk_up) or tk_cross_kj
+    ichi_below_cloud = price_below_cloud and (((tk < kj) and price_cross_tk and tk_up) or tk_cross_kj)
     
     # Nếu giá nằm trên mây, giá về gần dao 65 với khối lượng giảm dần và bật tăng
     near_k65 = (last['Low'] <= k65 * 1.03) and (last['Low'] >= k65 * 0.98)
@@ -202,7 +219,10 @@ def _check_early_buy_logic_only(df, idx):
     
     return False
 
-def check_add2(df, idx):
+def _check_early_buy_logic_only(df, idx):
+    return _eval_with_cache('early_logic', _check_early_buy_logic_only_impl, df, idx)
+
+def _check_add2_impl(df, idx):
     last = df.iloc[idx]
     prev = df.iloc[idx-1]
     
@@ -225,14 +245,17 @@ def check_add2(df, idx):
     # TH1: Nếu tenkan > kijun, điểm mua là khi heikin chuyển từ đỏ sang xanh
     case1 = (tk > kj) and (prev_ha_color == 'Red') and (ha_color == 'Green')
     
-    # TH2: Nếu tenkan < kijun, điểm mua là khi heikin vẫn là màu xanh, tenkan cắt lên kijun
+    # TH2: Nếu tenkan < kijun (trước đó), điểm mua là khi heikin vẫn là màu xanh, tenkan cắt lên kijun
     tk_cross_up = (prev['Tenkan'] <= prev['Kijun']) and (tk > kj)
-    case2 = (tk < kj) and (ha_color == 'Green') and tk_cross_up
+    case2 = (ha_color == 'Green') and tk_cross_up
     
     if case1 or case2: return "ICHIMOKU"
     return False
 
-def check_strong_buy(df, idx):
+def check_add2(df, idx):
+    return _eval_with_cache('add2', _check_add2_impl, df, idx)
+
+def _check_strong_buy_impl(df, idx):
     last = df.iloc[idx]
     prev = df.iloc[idx-1]
     
@@ -302,20 +325,14 @@ def check_strong_buy(df, idx):
     kumo_twist = (prev_future_spanA <= prev_future_spanB) and (future_spanA > future_spanB)
     case3_ichi = kumo_twist and (last['Close'] > cloud_top)
     
-    # 4. Trạng thái tối thượng: Strong Trend Confirmation
-    # Giá > mây, Tenkan > Kijun, Chikou > giá quá khứ, Mây phía trước xanh
-    price_gt_cloud = last['Close'] > cloud_top
-    tk_gt_kj = tk > kj
-    chikou_gt_price = last['Close'] > df['Close'].iloc[idx-26] if len(df) >= abs(idx)+26 else True
-    future_cloud_green = future_spanA > future_spanB
-    
-    case4_ichi = price_gt_cloud and tk_gt_kj and chikou_gt_price and future_cloud_green
-    
-    ichi_strong = case1_ichi or case2_ichi or case3_ichi or case4_ichi
+    ichi_strong = case1_ichi or case2_ichi or case3_ichi
     
     if ma_strong: return "MA"
     if ichi_strong: return "ICHIMOKU"
     return False
+
+def check_strong_buy(df, idx):
+    return _eval_with_cache('strong_buy', _check_strong_buy_impl, df, idx)
 
 def _eval_day_raw(df: pd.DataFrame, idx: int):
     """Raw signal evaluator for historical scanning (Deduplicated)."""

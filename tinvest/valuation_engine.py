@@ -262,31 +262,103 @@ def _calculate_exits_and_sr(df, inds: dict, entry_info: dict) -> dict:
         "break_buy": float(r1 * 1.01)
     }
 
-def _calculate_risk_score(inds: dict, exits: dict) -> dict:
+def _calculate_risk_score(df: pd.DataFrame, inds: dict, exits: dict) -> dict:
     p = inds["price"]
     score = 0
-    if p < inds["ma20"]: score += 30
-    if inds["tenkan"] < inds["kijun"]: score += 20
-    if p < inds["cloud_top"]: score += 20
-    if p < inds["k65"]: score += 20
     
-    # User's RR logic: Reward = tp - p, Risk = p - sl (cutloss_partial)
+    last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else last
+    
+    # 1. TREND STATE (Đo độ yếu xu hướng, Max 30)
+    score_trend = 0
+    if p < inds["ma20"]: score_trend += 8
+    if inds["tenkan"] < inds["kijun"]: score_trend += 8
+    
+    cloud_bottom = min(inds["span_a"], inds["span_b"])
+    if p < cloud_bottom:
+        score_trend += 15
+    elif p <= inds["cloud_top"]:  # Trong mây
+        score_trend += 10
+        
+    score += min(30, score_trend)
+    
+    # 2. STRUCTURE (Xương sống hệ thống, Max 35)
+    score_structure = 0
+    if p < inds["kijun"]: score_structure += 10
+    if p < inds["k65"]: score_structure += 20
+    
+    swing_low = float(df['Low'].iloc[-50:-1].min()) if len(df) >= 50 else float(df['Low'][:-1].min())
+    if p < swing_low:
+        score_structure += 15
+        
+    score += min(35, score_structure)
+    
+    # 3. VOLUME / DÒNG TIỀN (Max 25)
+    score_vsa = 0
+    
+    vol_dist = (last['Close'] < prev['Close']) and (last['Volume'] > prev['Volume'])
+    if vol_dist:
+        score_vsa += 15
+    elif (last['Close'] > prev['Close']) and (last['Volume'] < prev['Volume']):
+        score_vsa += 10
+        
+    avg_vol20 = float(df['Volume'].iloc[-20:].mean()) if len(df) >= 20 else float(df['Volume'].mean())
+    vol_weak = last['Volume'] < avg_vol20
+    prev_vol_weak = prev['Volume'] < (df['Volume'].iloc[-21:-1].mean() if len(df) >= 21 else avg_vol20)
+    
+    if vol_weak and prev_vol_weak:
+        score_vsa += 5
+        
+    score += min(25, score_vsa)
+    
+    # 4. CONTEXT (Max 10)
+    score_context = 0
+    p_ma50 = float(df['MA50'].iloc[-2]) if len(df) >= 2 and 'MA50' in df.columns else inds["ma50"]
+    if inds["ma50"] < p_ma50: # Ngược xu hướng lớn (MA50 dốc xuống)
+        score_context += 10
+        
+    near_res = (p >= exits["r1"] * 0.98) or (inds["cloud_top"] * 0.98 <= p <= inds["cloud_top"])
+    if near_res:
+        score_context += 5
+        
+    near_sup = (inds["k65"] * 1.02 >= p >= inds["k65"]) or (swing_low * 1.02 >= p >= swing_low)
+    if near_sup:
+        score_context -= 5
+        
+    score += min(10, max(-10, score_context))
+    
+    # 8. KILL SWITCH
+    if p < inds["k65"] and vol_dist:
+        score = max(score, 90)
+    
+    # Chuẩn hoá tổng điểm 0-100
+    score = int(max(0, min(100, score)))
+    
+    # Tách bóc R/R riêng biệt (Không cộng vào risk score)
     risk_amt = max(0.01, p - exits["cutloss_partial"])
     reward_amt = max(0.01, exits["tp1"] - p)
     
     risk_pct = round((risk_amt / p) * 100, 2)
     reward_pct = round((reward_amt / p) * 100, 2)
-    
     rr = reward_amt / risk_amt
-    if rr < 1.0: score += 10
     
-    desc = "Low" if score <= 30 else ("Medium" if score <= 60 else "High")
+    # Phân loại rủi ro chuẩn Trade
+    if score <= 25: desc = "LOW"
+    elif score <= 50: desc = "MEDIUM"
+    elif score <= 75: desc = "HIGH"
+    else: desc = "EXTREME"
+    
+    in_kumo = cloud_bottom <= p <= inds["cloud_top"]
+    
     return {
         "score": score, 
         "desc": desc, 
         "rr": round(rr, 2),
         "risk_pct": risk_pct,
-        "reward_pct": reward_pct
+        "reward_pct": reward_pct,
+        "vol_dist": vol_dist,
+        "vol_weak": vol_weak,
+        "in_kumo": in_kumo
     }
 
 def evaluate_stock_valuation(ticker: str, df: pd.DataFrame, entry_info: dict) -> dict:
@@ -308,23 +380,34 @@ def evaluate_stock_valuation(ticker: str, df: pd.DataFrame, entry_info: dict) ->
     exits = _calculate_exits_and_sr(df, inds, entry_info)
     
     # Step 6: Risk Scoring
-    risk = _calculate_risk_score(inds, exits)
+    risk = _calculate_risk_score(df, inds, exits)
     
     # Conclusion
-    # If there's an ENTRY TYPE today, action should not be NO unless extreme risk
     entry_today = entry_info.get("entry_type") != "NONE"
     
     action = "WAIT"
-    if entry_today:
-        if risk["score"] > 80:
-             action = "NO (Rủi ro cực cao)"
+    p_kj = price >= inds["kijun"]
+    
+    # 7. ACTION ENGINE
+    r_score = risk["score"]
+    
+    if r_score > 75 or price < inds["k65"] or risk["vol_dist"]:
+        action = "NO TRADE"
+    elif r_score <= 50:
+        if risk["vol_weak"] or risk["in_kumo"]:
+            action = "WAIT (Vol yếu / Giá trong mây)"
+        elif entry_today and p_kj and risk["rr"] >= 1.2:
+            action = "YES"
+        elif not entry_today and state in ["STRONG_UPTREND", "UPTREND"] and p_kj and risk["rr"] >= 1.2:
+            action = "YES (Breakout / Tiếp diễn)"
         else:
-             action = "YES" if (risk["rr"] >= 1.0 or state == "STRONG_UPTREND") else "WAIT (RR thấp)"
-    elif state in ["STRONG_UPTREND", "UPTREND"]:
-        action = "YES" if risk["rr"] >= 1.2 else "WAIT (RR thấp)"
-    elif state == "DOWNTREND":
-        action = "NO"
-        
+            action = "WAIT (Chưa Setup / RR Thấp / Dưới Kijun)"
+    elif r_score <= 75:
+        if entry_today and risk["rr"] >= 1.5:
+            action = "YES (Setup nén / Tỷ trọng nhỏ)"
+        else:
+            action = "WAIT (Rủi ro cao)"
+            
     fomo = price > inds["ma20"] * 1.12
 
     return {

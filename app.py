@@ -38,17 +38,9 @@ class TinvestApp:
         frame_mid = tk.Frame(self.root, pady=15, padx=10)
         frame_mid.pack(fill=tk.X)
         
-        # Option 1: Scanner
-        frame_scan = tk.LabelFrame(frame_mid, text="Phương án 1: Lọc Cổ Phiếu Tốt", font=("Arial", 10, "bold"), pady=10, padx=10)
-        frame_scan.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
-        
-        tk.Label(frame_scan, text="Lọc danh sách các mã đạt điểm 8 - 11").pack(pady=5)
-        btn_scan = tk.Button(frame_scan, text="🔍 Lọc Cổ Phiếu (Score ≥ 8)", command=self.run_scanner, bg="#2196F3", fg="white", font=("Arial", 10, "bold"))
-        btn_scan.pack(pady=5)
-
-        # Option 2: Analyzer
-        frame_analyze = tk.LabelFrame(frame_mid, text="Phương án 2: Phân Tích 1 Mã", font=("Arial", 10, "bold"), pady=10, padx=10)
-        frame_analyze.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5)
+        # Option 1: Analyzer
+        frame_analyze = tk.LabelFrame(frame_mid, text="Phương án 1: Phân Tích Tổng Hợp 1 Mã", font=("Arial", 10, "bold"), pady=10, padx=10)
+        frame_analyze.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
         
         tk.Label(frame_analyze, text="Nhập mã chứng khoán (VD: HPG, VNM):").pack(side=tk.LEFT, padx=5)
         self.entry_ticker = tk.Entry(frame_analyze, width=10, font=("Arial", 12))
@@ -57,7 +49,7 @@ class TinvestApp:
         btn_analyze.pack(side=tk.LEFT, padx=5)
 
         # --- Advanced Frame: 4 specific buttons ---
-        frame_adv = tk.LabelFrame(self.root, text="Phương án 3: Lọc Chuyên Sâu (Advanced Entry & Tích Lũy)", font=("Arial", 10, "bold"), pady=10, padx=10)
+        frame_adv = tk.LabelFrame(self.root, text="Phương án 2: Bảng Điều Khiển Lọc (Scanner & Market)", font=("Arial", 10, "bold"), pady=10, padx=10)
         frame_adv.pack(fill=tk.X, padx=10, pady=5)
         
         frame_adv_top = tk.Frame(frame_adv)
@@ -78,14 +70,17 @@ class TinvestApp:
         frame_adv_bot = tk.Frame(frame_adv)
         frame_adv_bot.pack(fill=tk.X, pady=5)
         
-        btn_accum = tk.Button(frame_adv_bot, text="📦 Cổ phiếu Tích Lũy (Chờ Breakout)", command=lambda: self.run_advanced_scanner("ACCUMULATION"), bg="#9C27B0", fg="white", font=("Arial", 10, "bold"))
+        btn_accum = tk.Button(frame_adv_bot, text="📦 Cổ phiếu Tích Lũy", command=lambda: self.run_advanced_scanner("ACCUMULATION"), bg="#9C27B0", fg="white", font=("Arial", 10, "bold"))
         btn_accum.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
 
-        btn_ma = tk.Button(frame_adv_bot, text="📈 Xu Hướng Hoàn Hảo (Perfect MA)", command=lambda: self.run_advanced_scanner("PERFECT_MA"), bg="#00BCD4", fg="white", font=("Arial", 10, "bold"))
+        btn_ma = tk.Button(frame_adv_bot, text="📈 Perfect MA", command=lambda: self.run_advanced_scanner("PERFECT_MA"), bg="#00BCD4", fg="white", font=("Arial", 10, "bold"))
         btn_ma.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
 
-        btn_breadth = tk.Button(frame_adv_bot, text="📊 Market Breadth (1 Năm)", command=self.show_market_breadth, bg="#607D8B", fg="white", font=("Arial", 10, "bold"))
+        btn_breadth = tk.Button(frame_adv_bot, text="📊 Chart Breadth", command=self.show_market_breadth, bg="#607D8B", fg="white", font=("Arial", 10, "bold"))
         btn_breadth.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
+
+        btn_market = tk.Button(frame_adv_bot, text="🏛️ Phân Tích Tổng Quan TT", command=self.run_market_analysis, bg="#E91E63", fg="white", font=("Arial", 10, "bold"))
+        btn_market.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
 
         # --- Bottom Frame: Output / Results ---
         frame_bottom = tk.LabelFrame(self.root, text="Kết Quả", font=("Arial", 10, "bold"), padx=10, pady=10)
@@ -154,7 +149,8 @@ class TinvestApp:
                 for ticker_val, group in grouped:
                     ticker = str(ticker_val).upper()
                     
-                    if not (len(ticker) == 3 and ticker.isalpha()) and ticker not in ["VNINDEX", "HNXINDEX"]:
+                    is_index = ("VNINDEX" in ticker) or ("HNX" in ticker) or ("HAINDEX" in ticker) or (ticker in ["VNI"])
+                    if not (len(ticker) == 3 and ticker.isalpha()) and not is_index:
                         continue
                         
                     sub = group.drop(columns=["Ticker"]).copy()
@@ -180,17 +176,17 @@ class TinvestApp:
             for k, v in self.data_dict.items():
                 self.data_dict[k] = v.sort_values(by="Date").reset_index(drop=True)
 
-            self.log_sync("[5/5] CẤU TRÚC LẠI DỮ LIỆU... Tính toán bộ lọc Ichimoku, VSA, HA trước (Pre-computing)... Vài giây...")
+            self.log_sync("[5/5] CẤU TRÚC LẠI DỮ LIỆU... Tính toán bộ lọc Ichimoku, VSA, HA trước (Pre-computing)...")
             
-            from tinvest.ichimoku_engine import analyze_ichimoku
+            from tinvest.ichimoku_engine import analyze_ichimoku, compute_ichimoku
             from tinvest.vsa_engine import analyze_vsa
             from tinvest.aic_engine import analyze_aic
-            from tinvest.scoring_engine import calculate_score
             from tinvest.advanced_entry import classify_entry
             from tinvest.accumulation_engine import analyze_accumulation
             from tinvest.ma_engine import analyze_ma_trend
             from tinvest.risk_engine import calculate_stoploss
-            from concurrent.futures import ThreadPoolExecutor
+            from tinvest.valuation_engine import evaluate_stock_valuation
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
             total_compute = len(self.data_dict)
             self.analysis_cache = {}
@@ -200,7 +196,6 @@ class TinvestApp:
                 ticker, df_sub = ticker_df_tuple
                 try:
                     # 1. Pre-calculate common indicators to share across engines
-                    from tinvest.ichimoku_engine import compute_ichimoku
                     df_rich = compute_ichimoku(df_sub)
                     
                     df_rich['MA10'] = df_rich['Close'].rolling(10).mean()
@@ -213,42 +208,44 @@ class TinvestApp:
                     ichi = analyze_ichimoku(df_rich)
                     vsa = analyze_vsa(df_rich)
                     aic = analyze_aic(df_rich)
-                    score = calculate_score(ichi, vsa, aic)
                     adv = classify_entry(df_rich)
                     accum = analyze_accumulation(df_rich)
                     ma_trend = analyze_ma_trend(df_rich)
                     risk = calculate_stoploss(df_rich, adv["entry_type"], float(df_sub["Close"].iloc[-1]), adv.get("details"))
+                    val = evaluate_stock_valuation(ticker, df_rich, adv)
                     
                     return ticker, {
                         "df": df_sub,
                         "ichi": ichi,
                         "vsa": vsa,
                         "aic": aic,
-                        "score": score,
                         "adv": adv,
                         "accum": accum,
                         "ma_trend": ma_trend,
-                        "risk": risk
+                        "risk": risk,
+                        "val": val
                     }
                 except Exception:
                     return ticker, None
 
-            self.log_sync(f"[5/5] CẤU TRÚC LẠI DỮ LIỆU... Đang chạy song song {total_compute} mã (Tốc độ cao)...")
+            self.log_sync(f"[5/5] CẤU TRÚC LẠI DỮ LIỆU... Đang chạy phân tán ({total_compute} mã)...")
             
             cmp = 0
-            # Sử dụng ThreadPoolExecutor để tận dụng CPU (Pandas/Numpy release GIL)
-            # Max workers có thể để None (mặc định) hoặc giới hạn ví dụ 10-20
-            with ThreadPoolExecutor(max_workers=None) as executor:
-                results = executor.map(_analyze_single, self.data_dict.items())
+            # Chia tối đa 16 luồng ảo cho I/O bound / Numpy vectorizations để bung tốc độ tối đa
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                # Giao việc (Submit) tất cả mã vào trong hồ
+                futures = [executor.submit(_analyze_single, item) for item in self.data_dict.items()]
                 
-                for ticker, res in results:
+                # as_completed lấy kết quả của mã NÀO XONG TRƯỚC ra trước, sẽ không bị mã lỗi chặn cứng luồng
+                for future in as_completed(futures):
+                    ticker, res = future.result()
                     if res:
                         self.analysis_cache[ticker] = res
                     
                     cmp += 1
-                    # Cập nhật log thường xuyên hơn (mỗi 20 mã hoặc 5%) để tránh cảm giác bị treo
-                    if cmp % 20 == 0 or cmp == total_compute:
-                        self.log_sync(f" ---> Tiến độ: {cmp}/{total_compute} mã ({int(cmp/total_compute*100)}%)...")
+                    # In tiến độ chi tiết mỗi khi xong 10 mã (hoặc 5%) để UI nháy liên tục cho User yên tâm
+                    if cmp % max(10, int(total_compute*0.05)) == 0 or cmp == total_compute:
+                        self.log_sync(f" ---> Tiến độ lập chỉ mục: {cmp}/{total_compute} mã ({int(cmp/total_compute*100)}%)...")
 
             self.log_sync("[6/6] Đang phân tích Market Breadth (Độ Rộng Thị Trường)...")
             breadth_dfs = []
@@ -293,44 +290,7 @@ class TinvestApp:
             self.log_sync(f"\n❌ GẶP LỖI TRONG QUÁ TRÌNH GHÉP FILE: {str(e)}")
 
 
-    def run_scanner(self):
-        if not self.analysis_cache:
-            messagebox.showwarning("Cảnh báo", "Hệ thống chưa lập chỉ mục hoặc nạp dữ liệu!")
-            return
-            
-        self.log_sync("Đang lấy từ bộ nhớ các mã đạt 8 - 11 điểm (thời gian tính: 0ms)...", clear=True)
-        self.root.update()
-        
-        try:
-            results = []
-            for ticker, data in self.analysis_cache.items():
-                if data["score"]["total_score"] >= 8:
-                    df = data["df"]
-                    last_close = float(df["Close"].iloc[-1])
-                    
-                    results.append({
-                        "Ticker": ticker,
-                        "Price": round(last_close, 2),
-                        "Trend": data["ichi"]["trend"],
-                        "MoneyFlow": data["vsa"]["dominant"].capitalize(),
-                        "Trigger": data["aic"]["setup"],
-                        "Score": data["score"]["total_score"],
-                        "Classification": data["score"]["classification"],
-                        "Action": _action_label(data["score"]["classification"], data["aic"]["setup"])
-                    })
-                    
-            if not results:
-                self.log_sync("Hoàn tất: Không có mã nào đạt điểm >= 8.")
-            else:
-                self.log_sync(f"Hoàn tất: Tìm thấy {len(results)} mã đạt tiêu chuẩn tiềm năng (Score >= 8).\n")
-                df_res = pd.DataFrame(results).sort_values("Score", ascending=False)
-                table_str = df_res.to_string(index=False, justify="left")
-                self.log_sync(table_str)
-                self.log_sync("\n" + "="*70)
-                self.log_sync("Gợi ý: Nhập mã chứng khoán tương ứng vào ô 'Tra Cứu' để phân tích chi tiết.")
-        except Exception as e:
-            messagebox.showerror("Lỗi khi lọc", str(e))
-            self.log_sync(f"Lỗi: {str(e)}")
+
 
     def run_analyzer(self):
         if not self.data_dict:   
@@ -399,14 +359,41 @@ class TinvestApp:
                     if not risk.get("is_valid", True):
                         continue # Skip high risk signals (>10%)
                         
+                    # Time Logic
+                    if entry_target in ["ACCUMULATION", "PERFECT_MA"]:
+                        time_lbl = "T0"
+                    else:
+                        time_lbl = "T-1" if any("T-1" in flag for flag in res.get("risk_flags", [])) else "T0"
+                        
+                    # Reason Logic
+                    if entry_target == "ACCUMULATION":
+                        reason = f"Tích Lũy ({accum.get('base_quality', '')})"
+                    elif entry_target == "PERFECT_MA":
+                        reason = "Full MA Up"
+                    else:
+                        reason = res.get("details", {}).get("source", "System")
+                        if reason == "MA": reason = "Moving Average"
+                        elif reason == "ICHIMOKU": reason = "Ichimoku Cloud"
+                        elif reason == "VSA": reason = "VSA Volume"
+                    
+                    last_vol = float(df['Volume'].iloc[-1])
+                    ep = risk.get("entry_price", 0)
+                    sl = risk.get("sl_price", 0)
+                    tp = risk.get("tp_price", 0)
+                    rr_ratio = round((tp - ep) / (ep - sl + 0.0001), 1) if ep > sl else 0
+                    
+                    val_score = data.get("val", {}).get("risk_score", 0) if data.get("val") else 0
+                    
                     results.append({
                         "Ticker": ticker,
-                        "Entry": risk.get("entry_price", 0),
-                        "SL": risk.get("sl_price", 0),
-                        "Target": risk.get("tp_price", 0),
-                        "Risk%": f"{risk.get('risk_pct', 0)}%",
-                        "Confidence/Quality": conf,
-                        "Notes/Risks": flags
+                        "Volume": f"{last_vol:,.0f}",
+                        "Entry": ep,
+                        "SL": sl,
+                        "Target": tp,
+                        "RR": f"{rr_ratio}:1",
+                        "Risk Point": f"{val_score}/100",
+                        "Time": time_lbl,
+                        "Reason": reason
                     })
                     
             if not results:
@@ -421,11 +408,131 @@ class TinvestApp:
         except Exception as e:
             self.log_sync(f"Lỗi: {str(e)}")
 
-    def show_market_breadth(self):
-        if getattr(self, 'market_breadth', None) is None or self.market_breadth.empty:
-            messagebox.showwarning("Cảnh báo", "Dữ liệu độ rộng thị trường chưa sẵn sàng. Vui lòng nạp file CSV!")
+    def run_market_analysis(self):
+        if not self.data_dict:
+            from tkinter import messagebox
+            messagebox.showwarning("Cảnh báo", "Vui lòng nạp dữ liệu!")
             return
             
+        self.log_sync("Đang xử lý Dữ liệu Thị trường (FTD, Phân phối, Breadth)...", clear=True)
+        self.root.update()
+        
+        try:
+            from tinvest.market_engine import analyze_market_index, analyze_market_breadth, evaluate_market_score, analyze_momentum_divergence
+            from tinvest.ichimoku_engine import compute_ichimoku, analyze_ichimoku
+            from tinvest.vsa_engine import analyze_vsa
+            from tinvest.ma_engine import analyze_ma_trend
+            
+            # 1. Breadth
+            breadth_res = analyze_market_breadth(self.data_dict, "VNINDEX")
+            
+            # Hàm phụ trợ chẩn bệnh nhanh Index
+            def analyze_full_index(idx_df: pd.DataFrame):
+                if idx_df is None or idx_df.empty: return None
+                df_rich = compute_ichimoku(idx_df.copy())
+                # Thêm MAs
+                df_rich['MA10'] = df_rich['Close'].rolling(10).mean()
+                df_rich['MA20'] = df_rich['Close'].rolling(20).mean()
+                df_rich['MA50'] = df_rich['Close'].rolling(50).mean()
+                df_rich['MA100'] = df_rich['Close'].rolling(100).mean()
+                df_rich['MA200'] = df_rich['Close'].rolling(200).mean()
+                
+                return {
+                    "regime": analyze_market_index(idx_df),
+                    "momentum": analyze_momentum_divergence(idx_df),
+                    "ichi": analyze_ichimoku(df_rich),
+                    "vsa": analyze_vsa(df_rich),
+                    "ma": analyze_ma_trend(df_rich)
+                }
+
+            # 2. VNINDEX & HNXINDEX Data
+            vn_key = next((k for k in self.data_dict.keys() if "VNINDEX" in k or k == "VNI"), "VNINDEX")
+            hn_key = next((k for k in self.data_dict.keys() if "HNX" in k or "HAINDEX" in k), "HNXINDEX")
+            
+            vn_full = analyze_full_index(self.data_dict.get(vn_key))
+            hn_full = analyze_full_index(self.data_dict.get(hn_key))
+            
+            vn_res = vn_full['regime'] if vn_full else None
+            hn_res = hn_full['regime'] if hn_full else None
+            
+            # 4. Master Score (VNINDEX is primary)
+            if vn_res and vn_res['regime'] != "UNKNOWN":
+                score_res = evaluate_market_score(vn_res, breadth_res)
+                # Bơm thêm động lượng vào hệ điểm 
+                if vn_full and vn_full['momentum']['rsi_divergence']: score_res['market_score'] = max(0, score_res['market_score'] - 2)
+            elif hn_res and hn_res['regime'] != "UNKNOWN":
+                score_res = evaluate_market_score(hn_res, breadth_res)
+            else:
+                score_res = {"market_score": 0, "health": "CHƯA RÕ"}
+                
+            report = []
+            report.append("="*60)
+            report.append("     BÁO CÁO TOÀN CẢNH THỊ TRƯỜNG CHUNG (MARKET REGIME)")
+            report.append("="*60)
+            
+            report.append(f"\n1. ĐÁNH GIÁ SỨC KHOẺ: {score_res['market_score']}/10 ({score_res['health']})")
+            
+            report.append(f"\n2. ĐỘ RỘNG THỊ TRƯỜNG (BREADTH): {breadth_res['breadth_label']}")
+            report.append(f" - Tổng mã quét: {breadth_res['total_scanned']}")
+            report.append(f" - Số mã Tăng / Giảm: {breadth_res['advances']} / {breadth_res['declines']} (Đứng giá: {breadth_res['unaltered']})")
+            report.append(f" - Tỷ lệ mã > MA50 (Dòng tiền khoẻ): {breadth_res['strong_stocks_pct']}%")
+            report.append(f" - Số lượng Leader (Vượt đỉnh Vol to): {breadth_res['breakout_leaders']} mã")
+            
+            def format_index(name, res_dict):
+                if not res_dict or res_dict['regime']['regime'] == "UNKNOWN":
+                    return f"\n--- TỔNG QUAN {name}: Không tìm thấy dữ liệu."
+                
+                res = res_dict['regime']
+                mom = res_dict['momentum']
+                ichi = res_dict['ichi']
+                vsa = res_dict['vsa']
+                ma = res_dict['ma']
+                
+                txt = f"\n--- TỔNG QUAN {name} ({res['date']})"
+                txt += f"\n * XU HƯỚNG CẤU TRÚC: {res['regime']}"
+                txt += f"\n * HÀNH ĐỘNG: {res['action']}"
+                
+                if res['regime'] == 'CONFIRMED UPTREND':
+                    txt += f"\n   - FTD: Đang Kích Hoạt (An Toàn)"
+                else:
+                    txt += f"\n   - Nỗ lực hồi phục (RA): Ngày thứ {res['ra_day']}"
+                    
+                txt += f"\n   - Ngày Phân Phối (Supply): {res['distribution_count']} ngày"
+                if res['distribution_count'] > 0:
+                    txt += f" ({', '.join(res['distribution_dates'])})"
+                
+                # Bổ sung Indicators
+                txt += f"\n * LƯỚI KỸ THUẬT (INDICATORS):"
+                # VSA
+                dominant_flow = "Dòng tiền VÀO" if vsa['dominant'] == 'bullish' else ("Dòng tiền CHỐT LỜI/RÚT RA" if vsa['dominant'] == 'bearish' else "Đi ngang Mất thanh khoản")
+                txt += f"\n   - Giá/Khối lượng (VSA): {dominant_flow}"
+                # Ichimoku
+                txt += f"\n   - Đám mây (Ichimoku): Trend {ichi['trend']} (Màu {ichi['cloud_color']}) chạy {ichi['price_vs_kumo']} Kumo."
+                # MA
+                txt += f"\n   - Xu hướng MA: {ma['trend_label']} (Tăng nóng: {'CÓ' if ma['is_extended_up'] else 'KHÔNG'})"
+                # Momentum
+                rsi_alert = '- CHÚ Ý: Đang Phân Kỳ Âm (Báo Đỉnh)' if mom['rsi_divergence'] else ('- Vùng Xấu/Rủi ro' if mom['is_bad_zone'] else 'An Toàn')
+                txt += f"\n   - Tâm lý (RSI 14): {mom['rsi_val']} {rsi_alert}"
+                macd_alert = '- CHÚ Ý: MACD Phân Kỳ Đảo Chiều' if mom['macd_divergence'] else ''
+                txt += f"\n   - Lực mua (MACD): {mom['macd_val']} (Hist: {mom['hist_val']}) {macd_alert}"
+                
+                return txt
+                
+            report.append(format_index(vn_key, vn_full).replace("---", "3."))
+            if hn_full:
+                report.append(format_index(hn_key, hn_full).replace("---", "4."))
+                
+            report.append("\n" + "="*60)
+            report.append("CHÚ THÍCH HÀNH ĐỘNG:")
+            report.append("- KHÔNG TRADE: Đứng ngoài tuyệt đối, Index gãy Trend / Chưa có FTD.")
+            report.append("- TRADE NHỎ: Dành cho Sideway, chỉ tham gia khi có dòng tiền/Lead.")
+            report.append("- TRADE MẠNH: Xác nhận Uptrend (Có FTD) + Phân phối an toàn.")
+            
+            self.log_sync("\n".join(report))
+            
+        except Exception as e:
+            self.log_sync(f"Lỗi phân tích thị trường: {str(e)}")
+
     def show_market_breadth(self):
         if getattr(self, 'market_breadth', None) is None or self.market_breadth.empty:
             from tkinter import messagebox

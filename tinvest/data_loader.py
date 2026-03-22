@@ -141,8 +141,8 @@ def load_data(file_path: "str | list[str]") -> "pd.DataFrame | dict[str, pd.Data
         for ticker_val in tickers:
             ticker = str(ticker_val).upper()
             
-            # Chỉ lấy các mã cổ phiếu cơ sở có đúng 3 chữ cái
-            if len(ticker) != 3 or not ticker.isalpha():
+            is_index = ("VNINDEX" in ticker) or ("HNX" in ticker) or ("HAINDEX" in ticker) or (ticker in ["VNI"])
+            if not (len(ticker) == 3 and ticker.isalpha()) and not is_index:
                 continue
                 
             sub = df[df["Ticker"] == ticker_val].copy().drop(columns=["Ticker"])
