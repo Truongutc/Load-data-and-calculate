@@ -7,7 +7,10 @@ Python package for systematic stock analysis using **Ichimoku**, **VSA**, and **
 ## Installation
 
 ```powershell
-pip install pandas numpy pytest
+# Sử dụng môi trường ảo (khuyến nghị)
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
 ---

@@ -299,3 +299,89 @@ def analyze_momentum_divergence(df: pd.DataFrame) -> dict:
         "macd_divergence": macd_div,
         "is_bad_zone": is_rsi_weak or (macd.iloc[-1] < 0 and hist.iloc[-1] < 0)
     }
+
+def calculate_index_sr(df: pd.DataFrame) -> dict:
+    """
+    Tính vùng Hỗ trợ / Kháng cự cho Index theo thuật toán riêng.
+    Cải tiến: Tìm đỉnh/đáy cục bộ trong 250 phiên để có dữ liệu tin cậy hơn.
+    """
+    if df is None or df.empty or len(df) < 200:
+        return {"s1": 0, "s2": 0, "r1": 0, "r2": 0}
+
+    cp = float(df['Close'].iloc[-1])
+    # Sử dụng rolling().mean() an toàn hơn
+    ma100_series = df['Close'].rolling(100).mean()
+    ma200_series = df['Close'].rolling(200).mean()
+    ma100 = float(ma100_series.iloc[-1]) if not pd.isna(ma100_series.iloc[-1]) else 0
+    ma200 = float(ma200_series.iloc[-1]) if not pd.isna(ma200_series.iloc[-1]) else 0
+
+    # 1. Thu thập các Đỉnh (Peaks) và Đáy (Valleys) cục bộ trong 250 phiên
+    lookback = min(250, len(df) - 10)
+    peaks = []
+    valleys = []
+    
+    # Quét từ quá khứ đến sát hiện tại (loại bỏ 2 nến cuối để tránh nhiễu nến đang chạy)
+    for i in range(len(df) - lookback, len(df) - 2):
+        # Window 5 phiên xung quanh (tổng 11) để xác định điểm xoay (Pivot)
+        if i < 5: continue
+        window_high = df['High'].iloc[i-5:i+6].max()
+        window_low = df['Low'].iloc[i-5:i+6].min()
+        
+        val_high = float(df['High'].iloc[i])
+        val_low = float(df['Low'].iloc[i])
+        
+        if val_high == window_high:
+            peaks.append(val_high)
+        if val_low == window_low:
+            valleys.append(val_low)
+
+    # Loại bỏ trùng lặp và sắp xếp
+    peaks = sorted(list(set(peaks)))
+    valleys = sorted(list(set(valleys)))
+
+    # A: Đỉnh ngắn hạn (gần nhất/cao nhất) mà tại đó cp > A
+    A_candidates = [p for p in peaks if p < cp]
+    A = max(A_candidates) if A_candidates else None
+
+    # C: Đáy gần nhất có giá < A (nếu tìm thấy A)
+    C = None
+    if A:
+        c_candidates = [v for v in valleys if v < A]
+        C = max(c_candidates) if c_candidates else None
+
+    # B: Đáy (Valley) mà tại đó B > cp (Kháng cự)
+    B_candidates = [v for v in valleys if v > cp]
+    B = min(B_candidates) if B_candidates else None
+
+    # 2. Tính Hỗ trợ (S)
+    s_candidates = []
+    if A: s_candidates.append(A)
+    if C: s_candidates.append(C)
+    if ma100 > 0 and cp > ma100: s_candidates.append(ma100)
+    if ma200 > 0 and cp > ma200: s_candidates.append(ma200)
+
+    # Quy tắc: s1 = max, s2 = max thứ 2
+    s_candidates = sorted(list(set(s_candidates)), reverse=True)
+    s1 = s_candidates[0] if len(s_candidates) > 0 else 0
+    s2 = s_candidates[1] if len(s_candidates) > 1 else 0
+
+    # 3. Tính Kháng cự (R)
+    r_candidates = []
+    if B: r_candidates.append(B)
+    # Các đỉnh cao hơn giá hiện tại cũng là kháng cự
+    r_peaks = [p for p in peaks if p > cp]
+    if r_peaks: r_candidates.extend(r_peaks[:2]) # Lấy 2 đỉnh gần nhất phía trên
+    
+    if ma100 > 0 and ma100 > cp: r_candidates.append(ma100)
+    if ma200 > 0 and ma200 > cp: r_candidates.append(ma200)
+
+    r_candidates = sorted(list(set(r_candidates)))
+    r1 = r_candidates[0] if len(r_candidates) > 0 else 0
+    r2 = r_candidates[1] if len(r_candidates) > 1 else 0
+
+    return {
+        "s1": round(s1, 2),
+        "s2": round(s2, 2),
+        "r1": round(r1, 2),
+        "r2": round(r2, 2)
+    }

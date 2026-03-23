@@ -158,6 +158,7 @@ def analyze_ichimoku(df: pd.DataFrame) -> dict:
         "kijun_slope":        kijun_slope,
         "tenkan_kijun_cross": tk_cross,
         "score":              score,
+        "tenkan":             float(last["Tenkan"]),
         "kijun":              float(last["Kijun"]),
         "kijun65":            float(last["Kijun65"]),
         "span_a":             float(span_a) if not pd.isna(span_a) else 0,

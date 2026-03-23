@@ -52,35 +52,47 @@ class TinvestApp:
         frame_adv = tk.LabelFrame(self.root, text="Phương án 2: Bảng Điều Khiển Lọc (Scanner & Market)", font=("Arial", 10, "bold"), pady=10, padx=10)
         frame_adv.pack(fill=tk.X, padx=10, pady=5)
         
-        frame_adv_top = tk.Frame(frame_adv)
-        frame_adv_top.pack(fill=tk.X)
+        # Row 1: Market Context (Breadth & Market Analysis)
+        frame_market = tk.Frame(frame_adv)
+        frame_market.pack(fill=tk.X, pady=2)
         
-        btn_early = tk.Button(frame_adv_top, text="🟢 Mua Sớm (EARLY)", command=lambda: self.run_advanced_scanner("EARLY"), bg="#4CAF50", fg="white", font=("Arial", 10, "bold"))
-        btn_early.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
-        
-        btn_add1 = tk.Button(frame_adv_top, text="🟡 Gia Tăng 1 (ADD 1)", command=lambda: self.run_advanced_scanner("ADD_1"), bg="#FFC107", fg="black", font=("Arial", 10, "bold"))
-        btn_add1.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
-        
-        btn_add2 = tk.Button(frame_adv_top, text="🟡 Gia Tăng 2 (ADD 2)", command=lambda: self.run_advanced_scanner("ADD_2"), bg="#FF9800", fg="white", font=("Arial", 10, "bold"))
-        btn_add2.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
-        
-        btn_strong = tk.Button(frame_adv_top, text="🔴 Mua Mạnh (STRONG)", command=lambda: self.run_advanced_scanner("STRONG"), bg="#F44336", fg="white", font=("Arial", 10, "bold"))
-        btn_strong.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
-        
-        frame_adv_bot = tk.Frame(frame_adv)
-        frame_adv_bot.pack(fill=tk.X, pady=5)
-        
-        btn_accum = tk.Button(frame_adv_bot, text="📦 Cổ phiếu Tích Lũy", command=lambda: self.run_advanced_scanner("ACCUMULATION"), bg="#9C27B0", fg="white", font=("Arial", 10, "bold"))
-        btn_accum.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
-
-        btn_ma = tk.Button(frame_adv_bot, text="📈 Perfect MA", command=lambda: self.run_advanced_scanner("PERFECT_MA"), bg="#00BCD4", fg="white", font=("Arial", 10, "bold"))
-        btn_ma.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
-
-        btn_breadth = tk.Button(frame_adv_bot, text="📊 Chart Breadth", command=self.show_market_breadth, bg="#607D8B", fg="white", font=("Arial", 10, "bold"))
+        btn_breadth = tk.Button(frame_market, text="📊 Chart Breadth (Độ rộng)", command=self.show_market_breadth, bg="#607D8B", fg="white", font=("Arial", 10, "bold"))
         btn_breadth.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
 
-        btn_market = tk.Button(frame_adv_bot, text="🏛️ Phân Tích Tổng Quan TT", command=self.run_market_analysis, bg="#E91E63", fg="white", font=("Arial", 10, "bold"))
+        btn_market = tk.Button(frame_market, text="🏛️ Phân Tích Tổng Quan VNINDEX", command=self.run_market_analysis, bg="#E91E63", fg="white", font=("Arial", 10, "bold"))
         btn_market.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
+
+        # Row 2: Basic Signals
+        frame_signals_1 = tk.Frame(frame_adv)
+        frame_signals_1.pack(fill=tk.X, pady=2)
+        
+        btn_early = tk.Button(frame_signals_1, text="🟢 Mua Sớm (EARLY)", command=lambda: self.run_advanced_scanner("EARLY"), bg="#4CAF50", fg="white", font=("Arial", 10, "bold"))
+        btn_early.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
+        
+        btn_add1 = tk.Button(frame_signals_1, text="🟡 Gia Tăng 1 (ADD 1)", command=lambda: self.run_advanced_scanner("ADD_1"), bg="#FFC107", fg="black", font=("Arial", 10, "bold"))
+        btn_add1.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
+        
+        btn_add2 = tk.Button(frame_signals_1, text="🟡 Gia Tăng 2 (ADD 2)", command=lambda: self.run_advanced_scanner("ADD_2"), bg="#FF9800", fg="white", font=("Arial", 10, "bold"))
+        btn_add2.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
+        
+        btn_strong = tk.Button(frame_signals_1, text="🔴 Mua Mạnh (STRONG)", command=lambda: self.run_advanced_scanner("STRONG"), bg="#F44336", fg="white", font=("Arial", 10, "bold"))
+        btn_strong.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
+        
+        # Row 3: Advanced Filters & Recommendations
+        frame_signals_2 = tk.Frame(frame_adv)
+        frame_signals_2.pack(fill=tk.X, pady=2)
+        
+        btn_accum = tk.Button(frame_signals_2, text="📦 Cổ phiếu Tích Lũy", command=lambda: self.run_advanced_scanner("ACCUMULATION"), bg="#9C27B0", fg="white", font=("Arial", 10, "bold"))
+        btn_accum.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
+
+        btn_ma = tk.Button(frame_signals_2, text="📈 Perfect MA", command=lambda: self.run_advanced_scanner("PERFECT_MA"), bg="#00BCD4", fg="white", font=("Arial", 10, "bold"))
+        btn_ma.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
+
+        btn_trade = tk.Button(frame_signals_2, text="✅ Cổ phiếu TRADE", command=lambda: self.run_advanced_scanner("TRADEABLE"), bg="#008B8B", fg="white", font=("Arial", 10, "bold"))
+        btn_trade.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
+
+        btn_wait = tk.Button(frame_signals_2, text="⏳ Cổ phiếu WAIT", command=lambda: self.run_advanced_scanner("WAIT"), bg="#D2691E", fg="white", font=("Arial", 10, "bold"))
+        btn_wait.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
 
         # --- Bottom Frame: Output / Results ---
         frame_bottom = tk.LabelFrame(self.root, text="Kết Quả", font=("Arial", 10, "bold"), padx=10, pady=10)
@@ -329,6 +341,7 @@ class TinvestApp:
             for ticker, data in self.analysis_cache.items():
                 res = data["adv"]
                 accum = data["accum"]
+                val = data.get("val", {})
                 
                 df = data["df"]
                 avg_vol_20 = df["Volume"].tail(20).mean() if len(df) >= 20 else df["Volume"].mean()
@@ -347,6 +360,20 @@ class TinvestApp:
                         size = "N/A"
                         conf = "HIGH"
                         flags = "MA10 > MA20 > MA50 > 100 > 200 (MA10 Up)"
+                elif entry_target == "TRADEABLE":
+                    action_str = val.get("action", "")
+                    if action_str.startswith("YES"):
+                        match = True
+                        size = res.get("position_size", "N/A")
+                        conf = res.get("confidence", "N/A")
+                        flags = action_str
+                elif entry_target == "WAIT":
+                    action_str = val.get("action", "")
+                    if action_str.startswith("WAIT"):
+                        match = True
+                        size = res.get("position_size", "N/A")
+                        conf = res.get("confidence", "N/A")
+                        flags = action_str
                 else:
                     if res["entry_type"] == entry_target:
                         match = True
@@ -418,7 +445,7 @@ class TinvestApp:
         self.root.update()
         
         try:
-            from tinvest.market_engine import analyze_market_index, analyze_market_breadth, evaluate_market_score, analyze_momentum_divergence
+            from tinvest.market_engine import analyze_market_index, analyze_market_breadth, evaluate_market_score, analyze_momentum_divergence, calculate_index_sr
             from tinvest.ichimoku_engine import compute_ichimoku, analyze_ichimoku
             from tinvest.vsa_engine import analyze_vsa
             from tinvest.ma_engine import analyze_ma_trend
@@ -442,7 +469,8 @@ class TinvestApp:
                     "momentum": analyze_momentum_divergence(idx_df),
                     "ichi": analyze_ichimoku(df_rich),
                     "vsa": analyze_vsa(df_rich),
-                    "ma": analyze_ma_trend(df_rich)
+                    "ma": analyze_ma_trend(df_rich),
+                    "sr": calculate_index_sr(idx_df)
                 }
 
             # 2. VNINDEX & HNXINDEX Data
@@ -487,10 +515,14 @@ class TinvestApp:
                 ichi = res_dict['ichi']
                 vsa = res_dict['vsa']
                 ma = res_dict['ma']
+                sr = res_dict.get('sr', {'s1':0, 's2':0, 'r1':0, 'r2':0})
                 
                 txt = f"\n--- TỔNG QUAN {name} ({res['date']})"
                 txt += f"\n * XU HƯỚNG CẤU TRÚC: {res['regime']}"
                 txt += f"\n * HÀNH ĐỘNG: {res['action']}"
+                
+                txt += f"\n * NGƯỠNG KHÁNG CỰ (R): {sr['r1'] if sr['r1'] > 0 else 'N/A'} | {sr['r2'] if sr['r2'] > 0 else 'N/A'}"
+                txt += f"\n * NGƯỠNG HỖ TRỢ (S): {sr['s1'] if sr['s1'] > 0 else 'N/A'} | {sr['s2'] if sr['s2'] > 0 else 'N/A'}"
                 
                 if res['regime'] == 'CONFIRMED UPTREND':
                     txt += f"\n   - FTD: Đang Kích Hoạt (An Toàn)"

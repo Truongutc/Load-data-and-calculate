@@ -112,9 +112,14 @@ def format_report(result: dict) -> str:
         lines.append("    - Cấu trúc: MA10 > 20 > 50 > 100 (Perfect Trend) - Dòng tiền đang vào rất mạnh.")
     
     # Ichimoku Explanation
-    tk_cross = "Cực mạnh (Tenkan > Kijun)" if ichi.get("tenkan_kijun_cross") == 'bullish' else "Yếu (Tenkan < Kijun)"
+    tenkan, kijun = ichi.get("tenkan", 0), ichi.get("kijun", 0)
+    tk_label = "Tích cực (Tenkan > Kijun)" if tenkan >= kijun else "Yếu (Tenkan < Kijun)"
+    if ichi.get("tenkan_kijun_cross") == 'bullish': 
+        tk_label = "Bùng nổ (Vừa Giao cắt Vàng T-K)"
+        
     kumo_pos = "Uptrend (Trên mây)" if ichi.get("price_vs_kumo") == 'above' else ("Sideway (Trong mây)" if ichi.get("price_vs_kumo") == 'inside' else "Downtrend (Dưới mây)")
-    lines.append(f"  • Ichimoku: {kumo_pos} | Momentum: {tk_cross}")
+    lines.append(f"  • Ichimoku: {kumo_pos} | Momentum: {tk_label}")
+    lines.append(f"    - Chi tiết: Tenkan ({tenkan:,.2f}) | Kijun ({kijun:,.2f})")
     lines.append("    - Ý nghĩa: Tenkan/Kijun thể hiện xung lực. Giá trên mây xác nhận chu kỳ tăng dài hạn.")
     
     # Chikou Explanation
