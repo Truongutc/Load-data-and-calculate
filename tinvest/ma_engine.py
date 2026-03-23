@@ -36,7 +36,7 @@ def analyze_ma_trend(df: pd.DataFrame) -> dict:
     ll10 = df['Low'].rolling(10).min().iloc[-1]
     above_ma50_last10 = ll10 >= ma50_last
     
-    is_perfect = (ma_order and ma_slope_up and close_above_ma20 and above_ma50_last10)
+    is_perfect = (ma_order and close_above_ma20 and above_ma50_last10)
     
     # Label trend
     if close_above_ma20 and ma20_last > ma50_last:

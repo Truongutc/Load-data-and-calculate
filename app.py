@@ -9,6 +9,68 @@ from tinvest.analyzer import analyze_stock, format_report
 import os
 import pandas as pd
 import threading
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+
+# --- GLOBAL WORKER FOR MULTIPROCESSING ---
+def analyze_ticker_worker(ticker_df_tuple):
+    """
+    Hàm worker chạy trên các tiến trình riêng biệt.
+    Phải nằm ở cấp độ module (top-level) để pickle được trên Windows.
+    """
+    ticker, df_sub = ticker_df_tuple
+    try:
+        from tinvest.ichimoku_engine import analyze_ichimoku, compute_ichimoku
+        from tinvest.vsa_engine import analyze_vsa
+        from tinvest.advanced_entry import classify_entry
+        from tinvest.accumulation_engine import analyze_accumulation
+        from tinvest.ma_engine import analyze_ma_trend
+        from tinvest.valuation_engine import evaluate_stock_valuation
+        
+        # 1. Pre-calculate common indicators
+        df_rich = compute_ichimoku(df_sub.copy())
+        
+        df_rich['MA10'] = df_rich['Close'].rolling(10).mean()
+        df_rich['MA20'] = df_rich['Close'].rolling(20).mean()
+        df_rich['MA50'] = df_rich['Close'].rolling(50).mean()
+        df_rich['MA100'] = df_rich['Close'].rolling(100).mean()
+        df_rich['MA200'] = df_rich['Close'].rolling(200).mean()
+        
+        # ATR14
+        h_l = df_rich['High'] - df_rich['Low']
+        h_pc = (df_rich['High'] - df_rich['Close'].shift(1)).abs()
+        l_pc = (df_rich['Low'] - df_rich['Close'].shift(1)).abs()
+        tr = pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
+        df_rich['ATR14'] = tr.rolling(14).mean()
+        
+        # AvgVolume20
+        df_rich['AvgVolume20'] = df_rich['Volume'].rolling(20).mean()
+        
+        # 2. Call engines
+        ichi = analyze_ichimoku(df_rich)
+        vsa = analyze_vsa(df_rich)
+        adv = classify_entry(df_rich)
+        accum = analyze_accumulation(df_rich)
+        ma_trend = analyze_ma_trend(df_rich)
+        val = evaluate_stock_valuation(ticker, df_rich, adv)
+        
+        return ticker, {
+            "df": df_sub,
+            "ichi": ichi,
+            "vsa": vsa,
+            "adv": adv,
+            "accum": accum,
+            "ma_trend": ma_trend,
+            "val": val
+        }
+    except Exception:
+        return ticker, None
+
+def analyze_batch_worker(batch):
+    """Xử lý một nhóm (batch) mã cổ phiếu trong một tiến trình duy nhất."""
+    results = []
+    for item in batch:
+        results.append(analyze_ticker_worker(item))
+    return results
 
 class TinvestApp:
     def __init__(self, root):
@@ -131,59 +193,66 @@ class TinvestApp:
 
     def _process_files_bg(self, files):
         try:
-            self.log_sync(f"[1/5] Đang nạp thô {len(files)} file lên RAM...")
-            dfs = []
-            for i, f in enumerate(files):
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            
+            # --- parallel loading ---
+            self.log_sync(f"[1/5] Đang nạp thô {len(files)} file lên RAM (Song song)...")
+            dfs = [None] * len(files)
+            
+            def _load_one(idx, path):
                 try:
-                    dfs.append(pd.read_csv(f))
+                    return idx, pd.read_csv(path)
                 except Exception:
-                    pass
-                if (i + 1) % 50 == 0:
-                     self.log_sync(f" ---> Đã đọc được {i + 1}/{len(files)} file.")
+                    return idx, None
+
+            with ThreadPoolExecutor(max_workers=min(32, len(files))) as loader_exec:
+                load_futures = [loader_exec.submit(_load_one, i, f) for i, f in enumerate(files)]
+                for fut in as_completed(load_futures):
+                    i, df_raw = fut.result()
+                    if df_raw is not None:
+                        dfs[i] = df_raw
+            
+            dfs = [d for d in dfs if d is not None]
             
             if not dfs:
                 self.log_sync("Lỗi: Không đọc được file nào hợp lệ.")
                 return
                 
-            self.log_sync("[2/4] Đang chuẩn hóa & Phân tách mã từ các file...")
-            valid_tickers_found = 0
+            self.log_sync("[2/4] Đang chuẩn hóa & Phân tách mã (Song song)...")
             
-            for i, raw_df in enumerate(dfs):
+            def _process_one_df(raw_df):
                 try:
-                    df_norm = _normalize_columns(raw_df)
-                    
-                    if "Ticker" in df_norm.columns:
-                        grouped = df_norm.groupby("Ticker")
+                    df_n = _normalize_columns(raw_df)
+                    results = []
+                    if "Ticker" in df_n.columns:
+                        grouped = df_n.groupby("Ticker")
                         for ticker_val, group in grouped:
-                            ticker = str(ticker_val).upper().strip()
-                            
-                            is_index = ("VNINDEX" in ticker) or ("HNX" in ticker) or ("HAINDEX" in ticker) or (ticker in ["VNI"])
-                            if not (len(ticker) == 3 and ticker.isalpha()) and not is_index:
+                            t = str(ticker_val).upper().strip()
+                            is_idx = ("VNINDEX" in t) or ("HNX" in t) or ("HAINDEX" in t)
+                            if not (len(t) == 3 and t.isalpha()) and not is_idx:
                                 continue
-                                
-                            sub = group.drop(columns=["Ticker"]).copy()
+                            sub_df = group.drop(columns=["Ticker"]).copy()
                             try:
-                                cleaned = _clean_dataframe(sub, ticker=ticker)
-                                if ticker in self.data_dict:
-                                    merged = pd.concat([self.data_dict[ticker], cleaned]).drop_duplicates(subset=["Date"]).sort_values("Date")
-                                    self.data_dict[ticker] = merged
-                                else:
-                                    self.data_dict[ticker] = cleaned
-                                    valid_tickers_found += 1
-                            except Exception as e:
-                                # Log thầm lặng các mã thiếu dữ liệu
-                                pass
+                                c = _clean_dataframe(sub_df, ticker=t)
+                                results.append((t, c))
+                            except: pass
                     else:
-                        # Trường hợp file chỉ có 1 mã (không có cột Ticker)
                         try:
-                            # Lấy tên file làm ticker nếu có thể, hoặc dùng SINGLE
-                            cleaned = _clean_dataframe(df_norm, ticker="SINGLE")
-                            self.data_dict["SINGLE"] = cleaned
-                            valid_tickers_found += 1
-                        except Exception:
-                            pass
-                except Exception as e:
-                    self.log_sync(f" ! Lỗi chuẩn hóa File {i+1}: {e}")
+                            c = _clean_dataframe(df_n, ticker="SINGLE")
+                            results.append(("SINGLE", c))
+                        except: pass
+                    return results
+                except: return []
+
+            with ThreadPoolExecutor(max_workers=16) as proc_exec:
+                proc_futures = [proc_exec.submit(_process_one_df, d) for d in dfs]
+                for fut in as_completed(proc_futures):
+                    chunk_res = fut.result()
+                    for t, c in chunk_res:
+                        if t in self.data_dict:
+                            self.data_dict[t] = pd.concat([self.data_dict[t], c]).drop_duplicates(subset=["Date"]).sort_values("Date")
+                        else:
+                            self.data_dict[t] = c
 
             total_valid = len(self.data_dict)
             self.log_sync(f" ---> Hoàn tất nạp dữ liệu. Đã nhận diện {total_valid} mã hợp lệ (3 ký tự).")
@@ -204,83 +273,59 @@ class TinvestApp:
             total_compute = len(self.data_dict)
             self.analysis_cache = {}
             
-            # --- 5.1 CHIA NHỎ CÔNG ĐOẠN: Tính toán đa luồng (Optimized) ---
-            def _analyze_single(ticker_df_tuple):
-                ticker, df_sub = ticker_df_tuple
-                try:
-                    # 1. Pre-calculate common indicators to share across engines
-                    df_rich = compute_ichimoku(df_sub)
-                    
-                    df_rich['MA10'] = df_rich['Close'].rolling(10).mean()
-                    df_rich['MA20'] = df_rich['Close'].rolling(20).mean()
-                    df_rich['MA50'] = df_rich['Close'].rolling(50).mean()
-                    df_rich['MA100'] = df_rich['Close'].rolling(100).mean()
-                    df_rich['MA200'] = df_rich['Close'].rolling(200).mean()
-                    
-                    # ATR14
-                    h_l = df_rich['High'] - df_rich['Low']
-                    h_pc = (df_rich['High'] - df_rich['Close'].shift(1)).abs()
-                    l_pc = (df_rich['Low'] - df_rich['Close'].shift(1)).abs()
-                    tr = pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
-                    df_rich['ATR14'] = tr.rolling(14).mean()
-                    
-                    # AvgVolume20
-                    df_rich['AvgVolume20'] = df_rich['Volume'].rolling(20).mean()
-                    
-                    # 2. Call engines using the enriched DataFrame
-                    ichi = analyze_ichimoku(df_rich)
-                    vsa = analyze_vsa(df_rich)
-                    adv = classify_entry(df_rich)
-                    accum = analyze_accumulation(df_rich)
-                    ma_trend = analyze_ma_trend(df_rich)
-                    val = evaluate_stock_valuation(ticker, df_rich, adv)
-                    
-                    return ticker, {
-                        "df": df_sub,
-                        "ichi": ichi,
-                        "vsa": vsa,
-                        "adv": adv,
-                        "accum": accum,
-                        "ma_trend": ma_trend,
-                        "val": val
-                    }
-                except Exception:
-                    return ticker, None
-
-            self.log_sync(f"[5/5] CẤU TRÚC LẠI DỮ LIỆU... Đang chạy phân tán ({total_compute} mã)...")
+            self.log_sync(f"[5/5] CẤU TRÚC LẠI DỮ LIỆU... Đang chạy đa tiến trình ({total_compute} mã)...")
             
             cmp = 0
-            # Chia tối đa 16 luồng ảo cho I/O bound / Numpy vectorizations để bung tốc độ tối đa
-            with ThreadPoolExecutor(max_workers=16) as executor:
-                # Giao việc (Submit) tất cả mã vào trong hồ
-                futures = [executor.submit(_analyze_single, item) for item in self.data_dict.items()]
+            items = list(self.data_dict.items())
+            
+            # Gom nhóm (Batching): mỗi batch khoảng 20 mã để tối ưu hóa overhead tiến trình
+            batch_size = 20
+            batches = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
+            
+            import os
+            num_workers = min(os.cpu_count() or 4, 8) # Ưu tiên dùng đa nhân thực (giống analogy 8 người 8 dao)
+            
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                # Giao các batch cho các tiến trình
+                futures = [executor.submit(analyze_batch_worker, b) for b in batches]
                 
-                # as_completed lấy kết quả của mã NÀO XONG TRƯỚC ra trước, sẽ không bị mã lỗi chặn cứng luồng
                 for future in as_completed(futures):
-                    ticker, res = future.result()
-                    if res:
-                        self.analysis_cache[ticker] = res
+                    batch_results = future.result()
+                    for ticker, res in batch_results:
+                        if res:
+                            self.analysis_cache[ticker] = res
                     
-                    cmp += 1
-                    # In tiến độ chi tiết mỗi khi xong 10 mã (hoặc 5%) để UI nháy liên tục cho User yên tâm
-                    if cmp % max(10, int(total_compute*0.05)) == 0 or cmp == total_compute:
-                        self.log_sync(f" ---> Tiến độ lập chỉ mục: {cmp}/{total_compute} mã ({int(cmp/total_compute*100)}%)...")
+                        cmp += 1
+                        # In tiến độ
+                        if cmp % max(10, int(total_compute*0.05)) == 0 or cmp == total_compute:
+                            self.log_sync(f" ---> Tiến độ lập chỉ mục: {cmp}/{total_compute} mã ({int(cmp/total_compute*100)}%)...")
 
-            self.log_sync("[6/6] Đang phân tích Market Breadth (Độ Rộng Thị Trường)...")
+            self.log_sync("[6/6] Đang cập nhật Market Breadth (Độ Rộng Thị Trường) từ KQ tính toán...")
             breadth_dfs = []
-            for ticker, df in self.data_dict.items():
+            
+            # Tái sử dụng kết quả đã tính toán trong analysis_cache để nhanh hơn
+            for ticker, analysis in self.analysis_cache.items():
                 try:
-                    temp = pd.DataFrame()
-                    temp['Date'] = df['Date']
+                    # analysis["df"] already has indicators if we pre-calculated them or if they are in the sub-engines
+                    df_sub = analysis["df"]
                     
-                    ma10 = df['Close'].rolling(10).mean()
-                    ma20 = df['Close'].rolling(20).mean()
-                    ma50 = df['Close'].rolling(50).mean()
+                    # Ensure MAs exist for breadth. 
+                    # Note: _analyze_single adds MA10, MA20, MA50 to the df it returns if we store it
+                    # But the 'df' in analysis might be the raw one. Let's make sure.
+                    # Looking at _analyze_single, it calculates them on df_rich.
+                    
+                    # We need a DataFrame with Date, >MA10, >MA20, >MA50
+                    temp = pd.DataFrame()
+                    temp['Date'] = df_sub['Date']
+                    
+                    ma10 = df_sub['Close'].rolling(10).mean()
+                    ma20 = df_sub['Close'].rolling(20).mean()
+                    ma50 = df_sub['Close'].rolling(50).mean()
                     
                     temp['Valid'] = 1
-                    temp['>MA10'] = (df['Close'] > ma10).astype(int)
-                    temp['>MA20'] = (df['Close'] > ma20).astype(int)
-                    temp['>MA50'] = (df['Close'] > ma50).astype(int)
+                    temp['>MA10'] = (df_sub['Close'] > ma10).astype(int)
+                    temp['>MA20'] = (df_sub['Close'] > ma20).astype(int)
+                    temp['>MA50'] = (df_sub['Close'] > ma50).astype(int)
                     
                     breadth_dfs.append(temp)
                 except Exception:
@@ -366,7 +411,7 @@ class TinvestApp:
                         match = True
                         size = "N/A"
                         conf = "HIGH"
-                        flags = "MA10 > MA20 > MA50 > 100 > 200 (MA10 Up)"
+                        flags = "MA10 > MA20 > MA50 > 100 > 200 (Giá > MA20 & Hỗ trợ MA50)"
                 elif entry_target == "TRADEABLE":
                     action_str = val.get("action", "")
                     if action_str.startswith("YES"):
@@ -479,17 +524,22 @@ class TinvestApp:
                 df_rich['MA100'] = df_rich['Close'].rolling(100).mean()
                 df_rich['MA200'] = df_rich['Close'].rolling(200).mean()
                 
+                from tinvest.advanced_entry import classify_entry
+                
                 return {
                     "regime": analyze_market_index(idx_df),
                     "momentum": analyze_momentum_divergence(idx_df),
                     "ichi": analyze_ichimoku(df_rich),
                     "vsa": analyze_vsa(df_rich),
                     "ma": analyze_ma_trend(df_rich),
-                    "sr": calculate_index_sr(idx_df)
+                    "sr": calculate_index_sr(idx_df),
+                    "signals": classify_entry(idx_df)
                 }
 
             # 2. VNINDEX & HNXINDEX Data
-            vn_key = next((k for k in self.data_dict.keys() if "VNINDEX" in k or k == "VNI"), "VNINDEX")
+            vn_key = next((k for k in self.data_dict.keys() if "VNINDEX" in k), "VNINDEX")
+            # If VNINDEX not found, maybe it's named VNI? But user said avoid VNI for index. 
+            # Usually index data has VNINDEX as ticker.
             hn_key = next((k for k in self.data_dict.keys() if "HNX" in k or "HAINDEX" in k), "HNXINDEX")
             
             vn_full = analyze_full_index(self.data_dict.get(vn_key))
@@ -562,6 +612,16 @@ class TinvestApp:
                 txt += f"\n   - Tâm lý (RSI 14): {mom['rsi_val']} {rsi_alert}"
                 macd_alert = '- CHÚ Ý: MACD Phân Kỳ Đảo Chiều' if mom['macd_divergence'] else ''
                 txt += f"\n   - Lực mua (MACD): {mom['macd_val']} (Hist: {mom['hist_val']}) {macd_alert}"
+
+                # Bổ sung Tín hiệu Mua
+                sigs = res_dict.get('signals', {})
+                if sigs and sigs.get('entry_type') != "NONE":
+                    etype = sigs['entry_type']
+                    conf = sigs['confidence']
+                    src = sigs.get('details', {}).get('source', '')
+                    txt += f"\n 🔥 TÍN HIỆU: {etype} ({conf}) | Dựa trên: {src}"
+                    if sigs.get('risk_flags'):
+                        txt += f"\n   - Ghi chú: {', '.join(sigs['risk_flags'])}"
                 
                 return txt
                 

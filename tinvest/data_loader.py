@@ -52,8 +52,19 @@ def _clean_dataframe(df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
     """Parse dates, sort, handle missing data, validate row count."""
     # Parse Date
     try:
-        # Convert to string first to handle YYYYMMDD integers
-        df["Date"] = pd.to_datetime(df["Date"].astype(str))
+        # Convert to string and clean up potential float strings (e.g. "20231026.0")
+        date_series = df["Date"].astype(str).str.replace(r"\.0$", "", regex=True)
+        
+        # If the strings are 8-digit YYYYMMDD, use explicit format for reliability
+        if date_series.str.match(r"^\d{8}$").all():
+            df["Date"] = pd.to_datetime(date_series, format="%Y%m%d")
+        else:
+            df["Date"] = pd.to_datetime(date_series, errors="coerce")
+            
+        if df["Date"].isna().any():
+            # Fallback for mixed or other formats
+            df["Date"] = pd.to_datetime(df["Date"], errors="raise")
+            
     except Exception as exc:
         raise ValueError(f"[{ticker}] Cannot parse Date column: {exc}") from exc
 
@@ -141,7 +152,7 @@ def load_data(file_path: "str | list[str]") -> "pd.DataFrame | dict[str, pd.Data
         for ticker_val in tickers:
             ticker = str(ticker_val).upper()
             
-            is_index = ("VNINDEX" in ticker) or ("HNX" in ticker) or ("HAINDEX" in ticker) or (ticker in ["VNI"])
+            is_index = ("VNINDEX" in ticker) or ("HNX" in ticker) or ("HAINDEX" in ticker)
             if not (len(ticker) == 3 and ticker.isalpha()) and not is_index:
                 continue
                 
