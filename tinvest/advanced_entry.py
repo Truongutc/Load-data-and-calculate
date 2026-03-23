@@ -11,6 +11,26 @@ def calculate_ha(df: pd.DataFrame) -> pd.DataFrame:
     df_ha['HA_Open'] = ha_open
     return df_ha
 
+def is_doji_or_pinbar(last, avg_spread):
+    """Detect clear bottom signals: Doji or Pin bar (Rút chân)."""
+    spread = last['High'] - last['Low']
+    if spread == 0: return True
+    
+    body = abs(last['Close'] - last['Open'])
+    
+    # Doji: Thân nến nhỏ so với toàn bộ nến
+    is_doji = body <= 0.15 * spread
+    
+    # Pin Bar (Rút chân dưới): Bóng nến dưới chiếm ít nhất 60% nến
+    lower_shadow = min(last['Open'], last['Close']) - last['Low']
+    is_pinbar_bottom = lower_shadow >= 0.6 * spread
+    
+    # Nến rút chân và đóng cửa ở 1/3 trên
+    close_pos = (last['Close'] - last['Low']) / spread
+    is_hammer = (close_pos > 0.6) and (lower_shadow > body)
+
+    return is_doji or is_pinbar_bottom or is_hammer
+
 # --- VSA PROXIES ---
 def get_vsa_signals(df, idx):
     last = df.iloc[idx]
@@ -23,10 +43,13 @@ def get_vsa_signals(df, idx):
     avg_spread20 = df['High'].iloc[idx-20:idx].mean() - df['Low'].iloc[idx-20:idx].mean() if len(df) >= abs(idx)+20 else df['Spread'].mean()
     
     # 1. STOPPING VOLUME / SELLING CLIMAX
-    stopping = (vol > 1.5 * avg_vol20) and \
-               (spread > avg_spread20) and \
+    stopping = (vol > 1.4 * avg_vol20) and \
+               (spread > 0.8 * avg_spread20) and \
                (last['Close'] > last['Low'] + 0.3 * spread) and \
-               (last['Close'] >= prev['Close'] * 0.99) # slightly down or up
+               (last['Close'] >= prev['Close'] * 0.985)
+               
+    # Selling Climax: Giảm mạnh + volume cực lớn
+    sc = (last['Close'] < prev['Close'] * 0.96) and (vol > 1.8 * avg_vol20)
                
     # 2. NO SUPPLY
     # small down bar: close < open AND close < previous close
@@ -57,7 +80,7 @@ def get_vsa_signals(df, idx):
                   small_spread and \
                   close_mid_upper
     
-    return {"stopping": stopping, "no_supply": no_supply, "test_supply": test_supply}
+    return {"stopping": stopping, "no_supply": no_supply, "test_supply": test_supply, "sc": sc}
 
 # --- SIGNAL MODULES ---
 def _eval_with_cache(cache_key, func, df, idx):
@@ -105,10 +128,37 @@ def _check_add1_strict_impl(df, idx):
     
     ma_pullback = uptrend_ma and touch_ma20 and green_candle and vol_up and not bad_drop and not ma20_flat_down
 
-    # TH2: MA20 cắt lên MA50 với khối lượng gia tăng, MA10 đang dốc lên
-    ma_cross = (prev['MA20'] <= prev['MA50']) and (ma20 > ma50) and (last['Volume'] > last['AvgVolume20']) and (ma10 > prev['MA10'])
+    # TH2: MA-Cross tinh chỉnh (New version)
+    # 1. Trend stable: Sum(C > MA20 AND C > MA50, 5) >= 4
+    check_window = 5
+    actual_pos = idx if idx >= 0 else len(df) + idx
+    if actual_pos >= check_window - 1:
+        df_sub = df.iloc[actual_pos - check_window + 1 : actual_pos + 1]
+        cond_trend_stable = ((df_sub['Close'] > df_sub['MA20']) & (df_sub['Close'] > df_sub['MA50'])).sum() >= 4
+    else:
+        cond_trend_stable = (last['Close'] > ma20) and (last['Close'] > ma50)
+
+    # 2. Not overextended: (C - MA20) <= 1.5 * ATR14
+    atr14 = last.get('ATR14', (last['High']-last['Low']) * 1.5) # Fallback if not calc yet
+    cond_not_overextended = (last['Close'] - ma20) <= (1.5 * atr14)
+
+    # 3. Volume good
+    avg_vol20 = last.get('AvgVolume20', last['Volume'])
+    cond_vol_up = last['Volume'] > 1.2 * avg_vol20
+    cond_no_blowoff = last['Volume'] < 2.5 * avg_vol20
     
-    ma_add1 = ma_pullback or ma_cross
+    body = abs(last['Close'] - last['Open'])
+    rng = last['High'] - last['Low'] + 1e-10
+    cond_no_spike = body <= 0.7 * rng
+    
+    prev_close = prev['Close']
+    cond_no_gap = (last['Open'] - prev_close) / prev_close < 0.03
+    
+    cond_volume_good = cond_vol_up and cond_no_blowoff and cond_no_spike and cond_no_gap
+    
+    ma_cross_refined = cond_trend_stable and cond_not_overextended and cond_volume_good
+    
+    ma_add1 = ma_pullback or ma_cross_refined
 
     # --- Ichimoku Logic ---
     tk = last['Tenkan']
@@ -136,7 +186,7 @@ def _check_add1_strict_impl(df, idx):
     ichi_add1 = ichi_below_cloud or ichi_above_cloud
 
     if ma_pullback: return "MA_PULLBACK"
-    if ma_cross: return "MA_CROSS"
+    if ma_cross_refined: return "MA_CROSS"
     if ichi_add1: return "ICHIMOKU"
     
     return False
@@ -176,13 +226,16 @@ def _check_early_buy_logic_only_impl(df, idx):
     # --- MA Logic ---
     # giá giảm và khối lượng giảm dần (vol_down)
     vol_down = df['Volume'].iloc[idx-10:idx-2].mean() < df['Volume'].iloc[idx-30:idx-10].mean() if len(df) >= abs(idx)+30 else True
+    # Bổ sung: Giá tạo đáy rõ ràng (doji/rút chân)
+    clear_bottom = is_doji_or_pinbar(last, df['High'].iloc[idx-20:idx].mean() - df['Low'].iloc[idx-20:idx].mean())
+    
     # MA10 đang dốc lên
     ma10_up = ma10 > p_ma10
     # MA10 cắt lên MA20 hoặc giá cắt lên trên MA10
     ma10_cross_ma20 = (prev['MA10'] <= prev['MA20']) and (ma10 > ma20)
     price_cross_ma10 = (prev['Close'] <= prev['MA10']) and (last['Close'] > ma10)
     
-    ma_buy = vol_down and ma10_up and (ma10_cross_ma20 or price_cross_ma10)
+    ma_buy = vol_down and clear_bottom and ma10_up and (ma10_cross_ma20 or price_cross_ma10)
     
     # --- Ichimoku Logic ---
     tk = last['Tenkan']
@@ -204,14 +257,32 @@ def _check_early_buy_logic_only_impl(df, idx):
     ichi_below_cloud = price_below_cloud and (((tk < kj) and price_cross_tk and tk_up) or tk_cross_kj)
     
     # Nếu giá nằm trên mây, giá về gần dao 65 với khối lượng giảm dần và bật tăng
+    # Bổ sung: Điều kiện Tenkan < Kijun cho Mua sớm trên mây
     near_k65 = (last['Low'] <= k65 * 1.03) and (last['Low'] >= k65 * 0.98)
-    bounce_k65 = price_above_cloud and near_k65 and vol_down and (last['Close'] > prev['Close'])
+    bounce_k65 = price_above_cloud and near_k65 and vol_down and (last['Close'] > prev['Close']) and (tk < kj)
     
     ichi_buy = ichi_below_cloud or bounce_k65
     
-    # --- VSA Logic ---
-    vsa = get_vsa_signals(df, idx)
-    vsa_buy = vsa['stopping'] or vsa['no_supply'] or vsa['test_supply']
+    # --- VSA Logic (3-phase Early Buy) ---
+    # Phase 1: Có Stopping Volume hoặc Selling Climax trong 20 phiên gần nhất
+    has_phase1 = False
+    for i in range(0, 21):
+        actual_pos = idx if idx >= 0 else len(df) + idx
+        if actual_pos - i < 0: break
+        vsa_past = get_vsa_signals(df, idx - i)
+        if vsa_past['stopping'] or vsa_past['sc']:
+            has_phase1 = True
+            break
+            
+    # Phase 2: Xác nhận cạn cung (No Supply / Test Supply) trong 5 phiên gần nhất
+    vsa_now = get_vsa_signals(df, idx)
+    has_phase2 = vsa_now['no_supply'] or vsa_now['test_supply']
+    
+    # Phase 3: Test thành công (Không thủng đáy gần nhất)
+    recent_low = df['Low'].iloc[idx-10:idx].min() if len(df) >= abs(idx)+10 else df['Low'].min()
+    test_success = last['Low'] >= recent_low * 0.99 # Cho phép sai số 1%
+    
+    vsa_buy = has_phase1 and has_phase2 and test_success
     
     if ma_buy: return "MA"
     if ichi_buy: return "ICHIMOKU"
@@ -259,17 +330,23 @@ def _check_strong_buy_impl(df, idx):
     last = df.iloc[idx]
     prev = df.iloc[idx-1]
     
-    ma10, ma20, ma50, ma100 = last['MA10'], last['MA20'], last['MA50'], last['MA100']
+    ma10, ma20, ma50, ma100, ma200 = last['MA10'], last['MA20'], last['MA50'], last['MA100'], last.get('MA200', 0)
     
     # --- Mua mạnh theo MA ---
-    # MA10 > ma20 > ma50 > ma100
-    perfect_trend = (ma10 > ma20 > ma50 > ma100)
-    # giá giảm với khối lượng nhỏ về test MA10 hoặc MA20
-    test_ma10_20 = (last['Low'] <= ma10 * 1.01 or last['Low'] <= ma20 * 1.01)
-    vol_small = last['Volume'] < last['AvgVolume20']
+    # 1. Cấu trúc xếp hàng: MA10 > ma20 > ma50 > ma100 > ma200
+    perfect_trend = (ma10 > ma20 > ma50 > ma100 > ma200)
+    
+    # 2. Giá không quá xa MA10 (tránh hưng phấn quá đà)
+    dist_ma10 = last['Close'] <= ma10 * 1.10
+    
+    # 3. Điều kiện khối lượng: Vol > AvgVol20 và Vol < 3 * AvgVol20 (không blow-off)
+    avg_vol20 = last['AvgVolume20']
+    vol_strong = last['Volume'] > avg_vol20
+    cond_no_blowoff = last['Volume'] < 3 * avg_vol20
+    
     green_candle = last['Close'] > last['Open']
     
-    ma_strong = perfect_trend and test_ma10_20 and vol_small and green_candle
+    ma_strong = perfect_trend and dist_ma10 and vol_strong and cond_no_blowoff and green_candle
 
     # --- Mua mạnh theo Ichimoku ---
     tk = last['Tenkan']
@@ -419,7 +496,7 @@ def ensure_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def classify_entry(df: pd.DataFrame) -> dict:
-    if len(df) < 200:
+    if len(df) < 2:
         return {"entry_type": "NONE", "confidence": "NONE", "position_size": "0%", "details": {}, "risk_flags": []}
         
     df = ensure_indicators(df.copy())

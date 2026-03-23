@@ -136,7 +136,7 @@ def analyze_vsa(df: pd.DataFrame) -> dict:
     dict  (see module docstring for schema)
     """
     if len(df) < VOL_WINDOW:
-        logger.warning(f"Only {len(df)} rows – VSA results may be unreliable.")
+        pass # Silenced as per user request to allow any row count
 
     avg_vol    = df["Volume"].rolling(VOL_WINDOW).mean()
     avg_spread = (df["High"] - df["Low"]).rolling(SPREAD_WINDOW).mean()

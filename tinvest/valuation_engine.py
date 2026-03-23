@@ -119,43 +119,64 @@ def _calculate_exits_and_sr(df, inds: dict, entry_info: dict) -> dict:
     
     if entry_type == "EARLY":
         if source == "MA":
-            r1 = min(p * 1.15, nearest_peak) if p * 1.15 < nearest_peak or nearest_peak < p else nearest_peak
-            r2 = max(p * 1.15, nearest_peak)
-            s1 = max(nearest_valley, ma10)
-            s2 = min(nearest_valley, ma10)
+            r1 = nearest_peak
+            r2 = second_peak
+            s1 = ma10
+            s2 = ma20
+            # SL1: thủng max( S1 giảm ~2.5% và giá hiện tại - 7% và đáy cũ gần nhất)
+            sl = max(s1 * 0.975, p * 0.93, nearest_valley)
+            # SL2: thủng min ( S1 giảm 2.5%, giá hiện tại -7%, đáy gần nhất)
+            sell_all = min(s1 * 0.975, p * 0.93, nearest_valley)
             tp = r1
-            ts = ma10
-            sl = max(p * 0.90, ma10, nearest_valley)
-            sell_all = min(p * 0.90, ma10, nearest_valley)
+            ts = min(r1, p * 1.10)
             
         elif source == "ICHIMOKU":
             if price_below_cloud:
-                r1 = min(kj, k65)
+                r1 = min(kj, k65, cloud_top if cloud_top > p else float('inf'))
                 r2 = max(kj, k65)
-                s1 = max(tk, nearest_valley)
-                s2 = min(tk, nearest_valley)
+                s1 = tk
+                s2 = nearest_valley
                 tp = r1
-                ts = min(r1 * 0.97, p * 1.10)
-                sl = max(tk, nearest_valley, p * 0.90)
-                sell_all = short_term_valley * 0.98
+                ts = min(r1 * 0.97, p * 1.07)
+                # Cắt lỗ max (Tenkan giảm 2.5% và đáy cũ)
+                sl = max(tk * 0.975, nearest_valley)
+                sell_all = min(tk * 0.975, nearest_valley)
             else: # trên mây
-                r1 = min(kj, nearest_peak)
-                r2 = max(kj, nearest_peak)
+                r1 = nearest_peak
+                r2 = second_peak
                 s1 = max(k65, tk)
                 s2 = min(k65, tk)
                 tp = r1
-                ts = min(r1 * 0.97, p * 1.10)
-                sl = s1 * 0.97
-                sell_all = cloud_top if p > cloud_top else cloud_bottom
-        else: # VSA or fallback
+                ts = min(r1, p * 1.10)
+                sl = s1 * 0.975
+                sell_all = s2 * 0.975
+        else: # VSA
+            # Logic VSA Early Exit
+            stop_low = nearest_valley
+            stop_mid = (p + nearest_valley) / 2
+            
+            # Tìm nến Stopping Volume / Selling Climax trong 30 phiên
+            from .advanced_entry import get_vsa_signals
+            for i in range(1, 31):
+                if len(df) < i+1: break
+                v_past = get_vsa_signals(df, -i)
+                if v_past.get('stopping') or v_past.get('sc'):
+                    stop_low = float(df['Low'].iloc[-i])
+                    stop_mid = (float(df['High'].iloc[-i]) + float(df['Low'].iloc[-i])) / 2
+                    break
+            
+            # S1: Hỗ trợ động (Low Test Supply gần nhất hoặc Mid Stopping)
+            v_now = get_vsa_signals(df, -1)
+            s1 = float(df['Low'].iloc[-1]) if v_now.get('test_supply') or v_now.get('no_supply') else stop_mid
+            s2 = stop_low # Hỗ trợ sống còn
+            
             r1 = nearest_peak
             r2 = second_peak
-            s1 = ma20
-            s2 = ma50
+            
             tp = r1
-            ts = max(ma20, p * 0.95)
-            sl = nearest_valley
-            sell_all = nearest_valley * 0.95
+            sl = s1
+            sell_all = s2
+            ts = s1 # Trailing Stop ban đầu = S1
 
     elif entry_type in ["ADD_1", "ADD_2"]:
         if source == "MA_PULLBACK":
@@ -208,27 +229,42 @@ def _calculate_exits_and_sr(df, inds: dict, entry_info: dict) -> dict:
             sell_all = ma50 * 0.97
 
     elif entry_type == "STRONG":
+        # Tìm đỉnh cao nhất 1 năm (250 phiên) cho R1
+        lookback_1y = df.iloc[-250:] if len(df) >= 250 else df
+        r1_1y = float(lookback_1y['High'].max())
+        
+        # Higher Low (Đáy cao nhất trong 10 phiên)
+        higher_low = float(df['Low'].iloc[-10:].max())
+        
         if source == "MA":
-            r1 = nearest_peak
-            r2 = second_peak
+            r1 = r1_1y
+            r2 = max(p * 1.15, p * 1.20, second_peak)
             s1 = ma10
             s2 = ma20
-            tp = max(p * 1.15, r1)
-            ts = min(p * 1.15, r1)
-            sl = min(s1 * 0.95, p * 0.90)
+            tp = r1
+            ts = max(ma10, kj, tk, higher_low)
+            sl = max(s1 * 0.95, p * 0.90)
             sell_all = s2 * 0.97
         elif source == "ICHIMOKU":
-            r1 = nearest_peak
-            r2 = second_peak
-            s1 = max(k65 if k65 < p else 0, tk)
-            s2_candidates = [val for val in (k65 if k65 < p else float('inf'), ma20, kj) if val > 0]
-            s2 = min(s2_candidates) if s2_candidates else min(ma20, kj)
+            r1 = r1_1y
+            # R2: mốc lợi nhuận +15%, +20% hoặc đỉnh lịch sử
+            r2 = max(p * 1.15, p * 1.20, second_peak)
+            
+            # S1 = Tenkan hoặc MA10 (cái cao hơn)
+            s1 = max(tk, ma10)
+            # S2 = Kijun (quan trọng nhất)
+            s2 = kj
+            
             tp = r1
-            ts = min(r1 * 0.97, p * 1.10)
-            sl = s1 * 0.97
-            sell_all = cloud_top if p > cloud_top else cloud_bottom
+            # Trailing = max(MA10, Kijun, HigherLow, tenkan)
+            ts = max(ma10, kj, tk, higher_low)
+            
+            # SL1 (Cảnh báo): max (MA10 - 5% hoặc Giá mua - 10% hoặc Tenkan - 5%)
+            sl = max(ma10 * 0.95, p * 0.90, tk * 0.95)
+            # SL2: max (MA20 - 3% và Kijun - 3%)
+            sell_all = max(ma20 * 0.97, kj * 0.97)
         else:
-            r1 = nearest_peak
+            r1 = r1_1y
             r2 = second_peak
             s1 = ma10
             s2 = ma20
@@ -362,8 +398,8 @@ def _calculate_risk_score(df: pd.DataFrame, inds: dict, exits: dict) -> dict:
     }
 
 def evaluate_stock_valuation(ticker: str, df: pd.DataFrame, entry_info: dict) -> dict:
-    if len(df) < 65:
-        return {"is_valid": False, "reason": "Dữ liệu quá ngắn (<65 phiên)"}
+    if len(df) < 2:
+        return {"is_valid": False, "reason": "Dữ liệu quá ngắn"}
 
     # Step 1: Get Basic Indicators
     inds = _get_indicators(df)

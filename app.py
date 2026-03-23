@@ -5,7 +5,6 @@ Giao diện người dùng cho hệ thống phân tích AIC code = AI + cơm!
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tinvest.data_loader import _normalize_columns, _clean_dataframe
-from tinvest.scanner import _action_label
 from tinvest.analyzer import analyze_stock, format_report
 import os
 import pandas as pd
@@ -140,63 +139,65 @@ class TinvestApp:
                 except Exception:
                     pass
                 if (i + 1) % 50 == 0:
-                    self.log_sync(f" ---> Đã đọc được {i + 1}/{len(files)} file.")
+                     self.log_sync(f" ---> Đã đọc được {i + 1}/{len(files)} file.")
             
             if not dfs:
                 self.log_sync("Lỗi: Không đọc được file nào hợp lệ.")
                 return
                 
-            self.log_sync("[2/5] Ghép nối toàn bộ dữ liệu thành 1 chuỗi liên tục (Merging)...")
-            raw = pd.concat(dfs, ignore_index=True)
+            self.log_sync("[2/4] Đang chuẩn hóa & Phân tách mã từ các file...")
+            valid_tickers_found = 0
             
-            self.log_sync("[3/5] Cấu trúc chuẩn hóa & làm sạch cột...")
-            df = _normalize_columns(raw)
-            
-            self.log_sync("[4/5] Phân rã dữ liệu theo từng mã chứng khoán (1-2 giây)!")
-            if "Ticker" in df.columns:
-                grouped = df.groupby("Ticker")
-                total_tickers = len(grouped)
-                
-                valid_count = 0
-                for ticker_val, group in grouped:
-                    ticker = str(ticker_val).upper()
+            for i, raw_df in enumerate(dfs):
+                try:
+                    df_norm = _normalize_columns(raw_df)
                     
-                    is_index = ("VNINDEX" in ticker) or ("HNX" in ticker) or ("HAINDEX" in ticker) or (ticker in ["VNI"])
-                    if not (len(ticker) == 3 and ticker.isalpha()) and not is_index:
-                        continue
-                        
-                    sub = group.drop(columns=["Ticker"]).copy()
-                    
-                    try:
-                        cleaned = _clean_dataframe(sub, ticker=ticker)
-                        if ticker in self.data_dict:
-                            merged = pd.concat([self.data_dict[ticker], cleaned]).drop_duplicates(subset=["Date"]).sort_values("Date")
-                            self.data_dict[ticker] = merged
-                        else:
-                            self.data_dict[ticker] = cleaned
+                    if "Ticker" in df_norm.columns:
+                        grouped = df_norm.groupby("Ticker")
+                        for ticker_val, group in grouped:
+                            ticker = str(ticker_val).upper().strip()
                             
-                        valid_count += 1
-                    except Exception:
-                        pass
-                    
-                    if valid_count % 100 == 0 and valid_count > 0:
-                        self.log_sync(f" ---> Đã lưu chuỗi thời gian phân tích cho mã thứ {valid_count}...")
-            else:
-                self.log_sync("Phát hiện CSV chỉ có 1 mã không có cột Ticker, sẽ tự xếp là SINGLE...")
-                self.data_dict["SINGLE"] = _clean_dataframe(df.copy(), ticker="SINGLE")
+                            is_index = ("VNINDEX" in ticker) or ("HNX" in ticker) or ("HAINDEX" in ticker) or (ticker in ["VNI"])
+                            if not (len(ticker) == 3 and ticker.isalpha()) and not is_index:
+                                continue
+                                
+                            sub = group.drop(columns=["Ticker"]).copy()
+                            try:
+                                cleaned = _clean_dataframe(sub, ticker=ticker)
+                                if ticker in self.data_dict:
+                                    merged = pd.concat([self.data_dict[ticker], cleaned]).drop_duplicates(subset=["Date"]).sort_values("Date")
+                                    self.data_dict[ticker] = merged
+                                else:
+                                    self.data_dict[ticker] = cleaned
+                                    valid_tickers_found += 1
+                            except Exception as e:
+                                # Log thầm lặng các mã thiếu dữ liệu
+                                pass
+                    else:
+                        # Trường hợp file chỉ có 1 mã (không có cột Ticker)
+                        try:
+                            # Lấy tên file làm ticker nếu có thể, hoặc dùng SINGLE
+                            cleaned = _clean_dataframe(df_norm, ticker="SINGLE")
+                            self.data_dict["SINGLE"] = cleaned
+                            valid_tickers_found += 1
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self.log_sync(f" ! Lỗi chuẩn hóa File {i+1}: {e}")
 
+            total_valid = len(self.data_dict)
+            self.log_sync(f" ---> Hoàn tất nạp dữ liệu. Đã nhận diện {total_valid} mã hợp lệ (3 ký tự).")
+            
             for k, v in self.data_dict.items():
                 self.data_dict[k] = v.sort_values(by="Date").reset_index(drop=True)
 
-            self.log_sync("[5/5] CẤU TRÚC LẠI DỮ LIỆU... Tính toán bộ lọc Ichimoku, VSA, HA trước (Pre-computing)...")
+            self.log_sync("[3/4] Bắt đầu tính toán các chỉ báo kỹ thuật liên thị trường...")
             
             from tinvest.ichimoku_engine import analyze_ichimoku, compute_ichimoku
             from tinvest.vsa_engine import analyze_vsa
-            from tinvest.aic_engine import analyze_aic
             from tinvest.advanced_entry import classify_entry
             from tinvest.accumulation_engine import analyze_accumulation
             from tinvest.ma_engine import analyze_ma_trend
-            from tinvest.risk_engine import calculate_stoploss
             from tinvest.valuation_engine import evaluate_stock_valuation
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -216,25 +217,31 @@ class TinvestApp:
                     df_rich['MA100'] = df_rich['Close'].rolling(100).mean()
                     df_rich['MA200'] = df_rich['Close'].rolling(200).mean()
                     
+                    # ATR14
+                    h_l = df_rich['High'] - df_rich['Low']
+                    h_pc = (df_rich['High'] - df_rich['Close'].shift(1)).abs()
+                    l_pc = (df_rich['Low'] - df_rich['Close'].shift(1)).abs()
+                    tr = pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
+                    df_rich['ATR14'] = tr.rolling(14).mean()
+                    
+                    # AvgVolume20
+                    df_rich['AvgVolume20'] = df_rich['Volume'].rolling(20).mean()
+                    
                     # 2. Call engines using the enriched DataFrame
                     ichi = analyze_ichimoku(df_rich)
                     vsa = analyze_vsa(df_rich)
-                    aic = analyze_aic(df_rich)
                     adv = classify_entry(df_rich)
                     accum = analyze_accumulation(df_rich)
                     ma_trend = analyze_ma_trend(df_rich)
-                    risk = calculate_stoploss(df_rich, adv["entry_type"], float(df_sub["Close"].iloc[-1]), adv.get("details"))
                     val = evaluate_stock_valuation(ticker, df_rich, adv)
                     
                     return ticker, {
                         "df": df_sub,
                         "ichi": ichi,
                         "vsa": vsa,
-                        "aic": aic,
                         "adv": adv,
                         "accum": accum,
                         "ma_trend": ma_trend,
-                        "risk": risk,
                         "val": val
                     }
                 except Exception:
@@ -382,9 +389,10 @@ class TinvestApp:
                         flags = ", ".join(res["risk_flags"]) if res["risk_flags"] else "None"
                         
                 if match:
-                    risk = data.get("risk", {})
-                    if not risk.get("is_valid", True):
-                        continue # Skip high risk signals (>10%)
+                    # Skip if risk is too high (>15%) or invalid data
+                    # (Nâng từ 10% lên 15% để phù hợp với các mã biến động mạnh - Penny/Midcap)
+                    if not val.get("is_valid") or val.get("risk_pct", 0) > 15.0:
+                        continue 
                         
                     # Time Logic
                     if entry_target in ["ACCUMULATION", "PERFECT_MA"]:
@@ -404,21 +412,28 @@ class TinvestApp:
                         elif reason == "VSA": reason = "VSA Volume"
                     
                     last_vol = float(df['Volume'].iloc[-1])
-                    ep = risk.get("entry_price", 0)
-                    sl = risk.get("sl_price", 0)
-                    tp = risk.get("tp_price", 0)
-                    rr_ratio = round((tp - ep) / (ep - sl + 0.0001), 1) if ep > sl else 0
+                    # ep = risk.get("entry_price", 0)
+                    # sl = risk.get("sl_price", 0)
+                    # tp = risk.get("tp_price", 0)
+                    # rr_ratio = round((tp - ep) / (ep - sl + 0.0001), 1) if ep > sl else 0
+                    
+                    ep = val.get("price", 0)
+                    tp = val.get("tp1", 0)
+                    rr_ratio = val.get("rr_ratio", 0)
                     
                     val_score = data.get("val", {}).get("risk_score", 0) if data.get("val") else 0
                     
+                    # --- Results Table Columns ---
+                    # Nhân 1000 cho Price, Entry, Target để về đơn vị VNĐ chuẩn
+                    current_p = float(df['Close'].iloc[-1]) * 1000
                     results.append({
                         "Ticker": ticker,
+                        "Price": f"{current_p:,.0f}",
                         "Volume": f"{last_vol:,.0f}",
-                        "Entry": ep,
-                        "SL": sl,
-                        "Target": tp,
-                        "RR": f"{rr_ratio}:1",
-                        "Risk Point": f"{val_score}/100",
+                        "Entry": f"{ep*1000:,.0f}" if ep > 0 else "N/A",
+                        "Target": f"{tp*1000:,.0f}" if tp > 0 else "N/A",
+                        "RR": f"{round(rr_ratio, 1)}/1" if rr_ratio > 0 else "N/A",
+                        "Risk Score": f"{int(val_score)}",
                         "Time": time_lbl,
                         "Reason": reason
                     })

@@ -30,6 +30,16 @@ def analyze_stock(ticker: str, df: pd.DataFrame) -> dict:
         df_rich['MA50'] = df_rich['Close'].rolling(50).mean()
         df_rich['MA100'] = df_rich['Close'].rolling(100).mean()
         df_rich['MA200'] = df_rich['Close'].rolling(200).mean()
+        
+        # ATR14
+        high_low = df_rich['High'] - df_rich['Low']
+        high_prev_close = (df_rich['High'] - df_rich['Close'].shift(1)).abs()
+        low_prev_close = (df_rich['Low'] - df_rich['Close'].shift(1)).abs()
+        tr = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
+        df_rich['ATR14'] = tr.rolling(14).mean()
+        
+        # AvgVolume20
+        df_rich['AvgVolume20'] = df_rich['Volume'].rolling(20).mean()
     
     # 2. Call engines using the enriched DataFrame
     ichi = analyze_ichimoku(df_rich)

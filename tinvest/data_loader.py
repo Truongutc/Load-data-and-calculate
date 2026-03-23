@@ -22,7 +22,7 @@ _COLUMN_ALIASES = {
     "ticker": ["ticker", "symbol", "ma_ck", "mã_ck", "stock", "code"],
 }
 
-MIN_ROWS = 25
+MIN_ROWS = 2
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:

@@ -104,7 +104,7 @@ def analyze_ichimoku(df: pd.DataFrame) -> dict:
     dict  (see module docstring for schema)
     """
     if len(df) < 52:
-        logger.warning("Less than 52 rows – Ichimoku results may be unreliable.")
+        pass # Silenced as per user request to allow any row count
 
     ichi = compute_ichimoku(df)
     last = ichi.iloc[-1]
