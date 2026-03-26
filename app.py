@@ -229,7 +229,7 @@ class TinvestApp:
                         for ticker_val, group in grouped:
                             t = str(ticker_val).upper().strip()
                             is_idx = ("VNINDEX" in t) or ("HNX" in t) or ("HAINDEX" in t)
-                            if not (len(t) == 3 and t.isalpha()) and not is_idx:
+                            if not (len(t) == 3 and t.isalnum()) and not is_idx:
                                 continue
                             sub_df = group.drop(columns=["Ticker"]).copy()
                             try:
@@ -510,8 +510,10 @@ class TinvestApp:
             from tinvest.vsa_engine import analyze_vsa
             from tinvest.ma_engine import analyze_ma_trend
             
-            # 1. Breadth
+            # 1. Breadth (tính trước để truyền vào regime engine)
             breadth_res = analyze_market_breadth(self.data_dict, "VNINDEX")
+            breadth_ma20 = breadth_res.get("strong_stocks_ma20_pct", 50.0)
+            breadth_ma50 = breadth_res.get("strong_stocks_pct", 50.0)
             
             # Hàm phụ trợ chẩn bệnh nhanh Index
             def analyze_full_index(idx_df: pd.DataFrame):
@@ -524,22 +526,50 @@ class TinvestApp:
                 df_rich['MA100'] = df_rich['Close'].rolling(100).mean()
                 df_rich['MA200'] = df_rich['Close'].rolling(200).mean()
                 
+                # ATR14
+                h_l = df_rich['High'] - df_rich['Low']
+                h_pc = (df_rich['High'] - df_rich['Close'].shift(1)).abs()
+                l_pc = (df_rich['Low'] - df_rich['Close'].shift(1)).abs()
+                tr = pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
+                df_rich['ATR14'] = tr.rolling(14).mean()
+                df_rich['AvgVolume20'] = df_rich['Volume'].rolling(20).mean()
+                
                 from tinvest.advanced_entry import classify_entry
+                from tinvest.valuation_engine import evaluate_stock_valuation
+                
+                # Tính momentum trước để truyền vào regime engine
+                mom = analyze_momentum_divergence(idx_df)
+                
+                # Tín hiệu mua Index
+                signals = classify_entry(df_rich)
+                
+                # S/R: Nếu có tín hiệu mua → dùng cách tính S/R của cổ phiếu (signal-aware)
+                #       Nếu không có tín hiệu → dùng cách tính pivot-based cho thị trường giảm
+                has_signal = signals.get('entry_type', 'NONE') != 'NONE'
+                if has_signal:
+                    val = evaluate_stock_valuation("INDEX", df_rich, signals)
+                    sr = {"s1": val.get("s1", 0), "s2": val.get("s2", 0),
+                          "r1": val.get("r1", 0), "r2": val.get("r2", 0)}
+                else:
+                    sr = calculate_index_sr(df_rich)
                 
                 return {
-                    "regime": analyze_market_index(idx_df),
-                    "momentum": analyze_momentum_divergence(idx_df),
+                    "regime": analyze_market_index(idx_df,
+                                                   breadth_pct_ma20=breadth_ma20,
+                                                   breadth_pct_ma50=breadth_ma50,
+                                                   momentum_data=mom),
+                    "momentum": mom,
                     "ichi": analyze_ichimoku(df_rich),
                     "vsa": analyze_vsa(df_rich),
                     "ma": analyze_ma_trend(df_rich),
-                    "sr": calculate_index_sr(idx_df),
-                    "signals": classify_entry(idx_df)
+                    "sr": sr,
+                    "sr_source": "SIGNAL" if has_signal else "PIVOT",
+                    "signals": signals
                 }
+
 
             # 2. VNINDEX & HNXINDEX Data
             vn_key = next((k for k in self.data_dict.keys() if "VNINDEX" in k), "VNINDEX")
-            # If VNINDEX not found, maybe it's named VNI? But user said avoid VNI for index. 
-            # Usually index data has VNINDEX as ticker.
             hn_key = next((k for k in self.data_dict.keys() if "HNX" in k or "HAINDEX" in k), "HNXINDEX")
             
             vn_full = analyze_full_index(self.data_dict.get(vn_key))
@@ -568,8 +598,21 @@ class TinvestApp:
             report.append(f"\n2. ĐỘ RỘNG THỊ TRƯỜNG (BREADTH): {breadth_res['breadth_label']}")
             report.append(f" - Tổng mã quét: {breadth_res['total_scanned']}")
             report.append(f" - Số mã Tăng / Giảm: {breadth_res['advances']} / {breadth_res['declines']} (Đứng giá: {breadth_res['unaltered']})")
+            report.append(f" - Tỷ lệ mã > MA20 (Dòng tiền ngắn hạn): {breadth_res.get('strong_stocks_ma20_pct', 'N/A')}%")
             report.append(f" - Tỷ lệ mã > MA50 (Dòng tiền khoẻ): {breadth_res['strong_stocks_pct']}%")
             report.append(f" - Số lượng Leader (Vượt đỉnh Vol to): {breadth_res['breakout_leaders']} mã")
+            
+            # Bảng Label các trạng thái (map tên kỹ thuật sang tên hiển thị)
+            regime_labels = {
+                "UPTREND": "📈 UPTREND (Tăng giá xác nhận)",
+                "UPTREND_UNDER_PRESSURE": "⚠️ UPTREND RỦI RO (Tiềm ẩn áp lực)",
+                "SIDEWAY": "↔️ SIDEWAY (Đi ngang/Tích lũy)",
+                "MARKET_WEAKENING": "📉 SUY YẾU (Thị trường yếu dần)",
+                "DOWNTREND": "🔴 DOWNTREND (Gấu/Điều chỉnh sâu)",
+                "RECOVERY": "🟡 HỒI PHỤC (Đang thăm dò đáy)",
+                "STABLE_RECOVERY": "🟢 HỒI PHỤC ỔN ĐỊNH (Có FTD sau đáy)",
+                "UNKNOWN": "❓ CHƯA XÁC ĐỊNH"
+            }
             
             def format_index(name, res_dict):
                 if not res_dict or res_dict['regime']['regime'] == "UNKNOWN":
@@ -581,18 +624,33 @@ class TinvestApp:
                 vsa = res_dict['vsa']
                 ma = res_dict['ma']
                 sr = res_dict.get('sr', {'s1':0, 's2':0, 'r1':0, 'r2':0})
+                sr_source = res_dict.get('sr_source', 'PIVOT')
+                sr_label = "Dựa trên tín hiệu mua" if sr_source == "SIGNAL" else "Dựa trên đỉnh/đáy lịch sử (thị trường không có tín hiệu)"
+                
+                regime_label = regime_labels.get(res['regime'], res['regime'])
                 
                 txt = f"\n--- TỔNG QUAN {name} ({res['date']})"
-                txt += f"\n * XU HƯỚNG CẤU TRÚC: {res['regime']}"
+                txt += f"\n * TRẠNG THÁI: {regime_label}"
                 txt += f"\n * HÀNH ĐỘNG: {res['action']}"
                 
                 txt += f"\n * NGƯỠNG KHÁNG CỰ (R): {sr['r1'] if sr['r1'] > 0 else 'N/A'} | {sr['r2'] if sr['r2'] > 0 else 'N/A'}"
                 txt += f"\n * NGƯỠNG HỖ TRỢ (S): {sr['s1'] if sr['s1'] > 0 else 'N/A'} | {sr['s2'] if sr['s2'] > 0 else 'N/A'}"
+                txt += f"\n   (Phương pháp S/R: {sr_label})"
+
                 
-                if res['regime'] == 'CONFIRMED UPTREND':
-                    txt += f"\n   - FTD: Đang Kích Hoạt (An Toàn)"
-                else:
+                # FTD & RA Info
+                if res['ftd_active']:
+                    ftd_q = res.get('ftd_quality', 'N/A')
+                    txt += f"\n   - FTD: Đang Kích Hoạt ({ftd_q})"
+                elif res['ra_day'] > 0:
                     txt += f"\n   - Nỗ lực hồi phục (RA): Ngày thứ {res['ra_day']}"
+                else:
+                    txt += f"\n   - FTD: Chưa kích hoạt | RA: Chưa bắt đầu"
+                
+                # Mức giảm từ đỉnh
+                decline_pct = res.get('decline_from_peak_pct', 0)
+                if decline_pct > 5:
+                    txt += f"\n   - ⚠️ Giảm từ đỉnh: -{decline_pct}%"
                     
                 txt += f"\n   - Ngày Phân Phối (Supply): {res['distribution_count']} ngày"
                 if res['distribution_count'] > 0:
@@ -630,15 +688,21 @@ class TinvestApp:
                 report.append(format_index(hn_key, hn_full).replace("---", "4."))
                 
             report.append("\n" + "="*60)
-            report.append("CHÚ THÍCH HÀNH ĐỘNG:")
-            report.append("- KHÔNG TRADE: Đứng ngoài tuyệt đối, Index gãy Trend / Chưa có FTD.")
-            report.append("- TRADE NHỎ: Dành cho Sideway, chỉ tham gia khi có dòng tiền/Lead.")
-            report.append("- TRADE MẠNH: Xác nhận Uptrend (Có FTD) + Phân phối an toàn.")
+            report.append("CHIẾN LƯỢC HÀNH ĐỘNG THEO TRẠNG THÁI:")
+            report.append("─"*60)
+            report.append("- UPTREND: 100% tỷ trọng, có thể Margin vào các Leader.")
+            report.append("- UPTREND RỦI RO: Không mua đuổi (FOMO), chốt lời từng phần.")
+            report.append("- SIDEWAY: Swing trade tại hỗ trợ, tỷ trọng 20-30%.")
+            report.append("- SUY YẾU: Tiền mặt tối thiểu 50%, chỉ mua khi có tín hiệu rõ.")
+            report.append("- DOWNTREND: Đứng ngoài. Chờ Nỗ lực hồi phục + FTD.")
+            report.append("- HỒI PHỤC: Thăm dò 10-20%, mua cổ phiếu khỏe hơn TT.")
+            report.append("- HỒI PHỤC ỔN ĐỊNH: Tăng 50-75%, tập trung Leader + tích nền.")
             
             self.log_sync("\n".join(report))
             
         except Exception as e:
             self.log_sync(f"Lỗi phân tích thị trường: {str(e)}")
+
 
     def show_market_breadth(self):
         if getattr(self, 'market_breadth', None) is None or self.market_breadth.empty:
