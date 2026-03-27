@@ -6,10 +6,113 @@ Supports single-ticker and multi-ticker CSV files.
 """
 
 import logging
+import numpy as np
 import pandas as pd
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+# ── Centralized Enrichment ─────────────────────────────────────────────────────
+
+def _donchian_mid(series_high: pd.Series, series_low: pd.Series, period: int) -> pd.Series:
+    """(highest_high + lowest_low) / 2 over rolling window."""
+    return (series_high.rolling(window=period).max() + series_low.rolling(window=period).min()) / 2
+
+
+def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Enriches an OHLCV DataFrame with ALL technical indicators needed by every engine.
+    
+    This is the SINGLE SOURCE OF TRUTH for indicator calculation.
+    All engines should call this once, then read pre-computed columns.
+    
+    The function is idempotent — columns that already exist are skipped.
+    
+    Indicators computed:
+        - MA: MA10, MA20, MA50, MA100, MA200
+        - Volatility: ATR14
+        - Volume: AvgVolume20
+        - Ichimoku: Tenkan, Kijun, Kijun65, SpanA, SpanB, Chikou, CloudTop, CloudBottom
+        - Heikin Ashi: HA_Open, HA_Close, HA_Color
+        - VSA helpers: Spread, Avg_Spread_20, Stopping_Vol, No_Supply, Test_Supply
+    """
+    if len(df) < 2:
+        return df
+
+    out = df
+
+    # ── 1. Moving Averages ─────────────────────────────────────────────────
+    for period, name in [(10, 'MA10'), (20, 'MA20'), (50, 'MA50'), (100, 'MA100'), (200, 'MA200')]:
+        if name not in out.columns:
+            out[name] = out['Close'].rolling(period).mean()
+
+    # ── 2. ATR14 ───────────────────────────────────────────────────────────
+    if 'ATR14' not in out.columns:
+        high_low = out['High'] - out['Low']
+        high_prev_close = (out['High'] - out['Close'].shift(1)).abs()
+        low_prev_close = (out['Low'] - out['Close'].shift(1)).abs()
+        tr = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
+        out['ATR14'] = tr.rolling(14).mean()
+
+    # ── 3. Volume ──────────────────────────────────────────────────────────
+    if 'AvgVolume20' not in out.columns:
+        out['AvgVolume20'] = out['Volume'].rolling(20).mean()
+
+    # ── 4. Ichimoku ────────────────────────────────────────────────────────
+    if 'Tenkan' not in out.columns:
+        out['Tenkan'] = _donchian_mid(out['High'], out['Low'], 9)
+    if 'Kijun' not in out.columns:
+        out['Kijun'] = _donchian_mid(out['High'], out['Low'], 26)
+    if 'Kijun65' not in out.columns:
+        out['Kijun65'] = _donchian_mid(out['High'], out['Low'], 65)
+    if 'SpanA' not in out.columns:
+        out['SpanA'] = ((out['Tenkan'] + out['Kijun']) / 2).shift(26)
+    if 'SpanB' not in out.columns:
+        out['SpanB'] = _donchian_mid(out['High'], out['Low'], 52).shift(26)
+    if 'Chikou' not in out.columns:
+        out['Chikou'] = out['Close'].shift(-26)
+    if 'CloudTop' not in out.columns:
+        out['CloudTop'] = out[['SpanA', 'SpanB']].max(axis=1)
+    if 'CloudBottom' not in out.columns:
+        out['CloudBottom'] = out[['SpanA', 'SpanB']].min(axis=1)
+
+    # ── 5. Heikin Ashi ─────────────────────────────────────────────────────
+    if 'HA_Color' not in out.columns:
+        ha_close = (out['Open'] + out['High'] + out['Low'] + out['Close']) / 4
+        ha_open = np.zeros(len(out))
+        ha_open[0] = (out['Open'].iloc[0] + out['Close'].iloc[0]) / 2
+        for i in range(1, len(out)):
+            ha_open[i] = (ha_open[i-1] + ha_close.iloc[i-1]) / 2
+        out['HA_Open'] = ha_open
+        out['HA_Close'] = ha_close
+        out['HA_Color'] = np.where(ha_close > ha_open, 'Green', 'Red')
+
+    # ── 6. VSA Helpers ─────────────────────────────────────────────────────
+    if 'Spread' not in out.columns:
+        out['Spread'] = out['High'] - out['Low']
+    if 'Avg_Spread_20' not in out.columns:
+        out['Avg_Spread_20'] = out['Spread'].rolling(20).mean()
+    if 'Stopping_Vol' not in out.columns:
+        out['Stopping_Vol'] = (
+            (out['Volume'] > 1.5 * out['AvgVolume20']) &
+            (out['Spread'] > out['Avg_Spread_20']) &
+            (out['Close'] > out['Low'] + 0.3 * out['Spread'])
+        )
+    if 'No_Supply' not in out.columns:
+        out['No_Supply'] = (
+            (out['Volume'] < 0.7 * out['AvgVolume20']) &
+            (out['Spread'] < out['Avg_Spread_20']) &
+            (out['Close'] < out['Open'])
+        )
+    if 'Test_Supply' not in out.columns:
+        out['Test_Supply'] = (
+            (out['Volume'] < out['AvgVolume20']) &
+            (out['Spread'] < out['Avg_Spread_20'] * 0.8) &
+            (out['Close'] > out['Low'] + 0.4 * out['Spread'])
+        )
+
+    return out
 
 # ── Column name aliases accepted in input CSV ──────────────────────────────────
 _COLUMN_ALIASES = {

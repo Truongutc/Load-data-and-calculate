@@ -16,36 +16,22 @@ def analyze_ticker_worker(ticker_df_tuple):
     """
     Hàm worker chạy trên các tiến trình riêng biệt.
     Phải nằm ở cấp độ module (top-level) để pickle được trên Windows.
+    Sử dụng enrich_dataframe() tập trung để tránh tính toán trùng lặp.
     """
     ticker, df_sub = ticker_df_tuple
     try:
-        from tinvest.ichimoku_engine import analyze_ichimoku, compute_ichimoku
+        from tinvest.data_loader import enrich_dataframe
+        from tinvest.ichimoku_engine import analyze_ichimoku
         from tinvest.vsa_engine import analyze_vsa
         from tinvest.advanced_entry import classify_entry
         from tinvest.accumulation_engine import analyze_accumulation
         from tinvest.ma_engine import analyze_ma_trend
         from tinvest.valuation_engine import evaluate_stock_valuation
         
-        # 1. Pre-calculate common indicators
-        df_rich = compute_ichimoku(df_sub.copy())
+        # 1. Enrich data 1 lần duy nhất (MA, ATR, Ichimoku, HA, VSA helpers)
+        df_rich = enrich_dataframe(df_sub.copy())
         
-        df_rich['MA10'] = df_rich['Close'].rolling(10).mean()
-        df_rich['MA20'] = df_rich['Close'].rolling(20).mean()
-        df_rich['MA50'] = df_rich['Close'].rolling(50).mean()
-        df_rich['MA100'] = df_rich['Close'].rolling(100).mean()
-        df_rich['MA200'] = df_rich['Close'].rolling(200).mean()
-        
-        # ATR14
-        h_l = df_rich['High'] - df_rich['Low']
-        h_pc = (df_rich['High'] - df_rich['Close'].shift(1)).abs()
-        l_pc = (df_rich['Low'] - df_rich['Close'].shift(1)).abs()
-        tr = pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
-        df_rich['ATR14'] = tr.rolling(14).mean()
-        
-        # AvgVolume20
-        df_rich['AvgVolume20'] = df_rich['Volume'].rolling(20).mean()
-        
-        # 2. Call engines
+        # 2. Call engines — tất cả đều đọc columns đã có sẵn, không tính lại
         ichi = analyze_ichimoku(df_rich)
         vsa = analyze_vsa(df_rich)
         adv = classify_entry(df_rich)
@@ -53,8 +39,9 @@ def analyze_ticker_worker(ticker_df_tuple):
         ma_trend = analyze_ma_trend(df_rich)
         val = evaluate_stock_valuation(ticker, df_rich, adv)
         
+        # Lưu df_rich (đã enrich) thay vì df raw để tái sử dụng cho breadth, scanner
         return ticker, {
-            "df": df_sub,
+            "df": df_rich,
             "ichi": ichi,
             "vsa": vsa,
             "adv": adv,
@@ -261,14 +248,6 @@ class TinvestApp:
                 self.data_dict[k] = v.sort_values(by="Date").reset_index(drop=True)
 
             self.log_sync("[3/4] Bắt đầu tính toán các chỉ báo kỹ thuật liên thị trường...")
-            
-            from tinvest.ichimoku_engine import analyze_ichimoku, compute_ichimoku
-            from tinvest.vsa_engine import analyze_vsa
-            from tinvest.advanced_entry import classify_entry
-            from tinvest.accumulation_engine import analyze_accumulation
-            from tinvest.ma_engine import analyze_ma_trend
-            from tinvest.valuation_engine import evaluate_stock_valuation
-            from concurrent.futures import ThreadPoolExecutor, as_completed
 
             total_compute = len(self.data_dict)
             self.analysis_cache = {}
@@ -303,29 +282,18 @@ class TinvestApp:
             self.log_sync("[6/6] Đang cập nhật Market Breadth (Độ Rộng Thị Trường) từ KQ tính toán...")
             breadth_dfs = []
             
-            # Tái sử dụng kết quả đã tính toán trong analysis_cache để nhanh hơn
+            # Tái sử dụng MA đã tính sẵn trong df_rich (enrich_dataframe đã tính MA10/MA20/MA50)
             for ticker, analysis in self.analysis_cache.items():
                 try:
-                    # analysis["df"] already has indicators if we pre-calculated them or if they are in the sub-engines
-                    df_sub = analysis["df"]
+                    df_sub = analysis["df"]  # df_rich đã có sẵn MA10, MA20, MA50
                     
-                    # Ensure MAs exist for breadth. 
-                    # Note: _analyze_single adds MA10, MA20, MA50 to the df it returns if we store it
-                    # But the 'df' in analysis might be the raw one. Let's make sure.
-                    # Looking at _analyze_single, it calculates them on df_rich.
-                    
-                    # We need a DataFrame with Date, >MA10, >MA20, >MA50
                     temp = pd.DataFrame()
                     temp['Date'] = df_sub['Date']
-                    
-                    ma10 = df_sub['Close'].rolling(10).mean()
-                    ma20 = df_sub['Close'].rolling(20).mean()
-                    ma50 = df_sub['Close'].rolling(50).mean()
-                    
                     temp['Valid'] = 1
-                    temp['>MA10'] = (df_sub['Close'] > ma10).astype(int)
-                    temp['>MA20'] = (df_sub['Close'] > ma20).astype(int)
-                    temp['>MA50'] = (df_sub['Close'] > ma50).astype(int)
+                    # Đọc trực tiếp từ columns đã enrich, không cần tính lại
+                    temp['>MA10'] = (df_sub['Close'] > df_sub['MA10']).astype(int)
+                    temp['>MA20'] = (df_sub['Close'] > df_sub['MA20']).astype(int)
+                    temp['>MA50'] = (df_sub['Close'] > df_sub['MA50']).astype(int)
                     
                     breadth_dfs.append(temp)
                 except Exception:
@@ -506,7 +474,7 @@ class TinvestApp:
         
         try:
             from tinvest.market_engine import analyze_market_index, analyze_market_breadth, evaluate_market_score, analyze_momentum_divergence, calculate_index_sr
-            from tinvest.ichimoku_engine import compute_ichimoku, analyze_ichimoku
+            from tinvest.ichimoku_engine import analyze_ichimoku
             from tinvest.vsa_engine import analyze_vsa
             from tinvest.ma_engine import analyze_ma_trend
             
@@ -518,24 +486,12 @@ class TinvestApp:
             # Hàm phụ trợ chẩn bệnh nhanh Index
             def analyze_full_index(idx_df: pd.DataFrame):
                 if idx_df is None or idx_df.empty: return None
-                df_rich = compute_ichimoku(idx_df.copy())
-                # Thêm MAs
-                df_rich['MA10'] = df_rich['Close'].rolling(10).mean()
-                df_rich['MA20'] = df_rich['Close'].rolling(20).mean()
-                df_rich['MA50'] = df_rich['Close'].rolling(50).mean()
-                df_rich['MA100'] = df_rich['Close'].rolling(100).mean()
-                df_rich['MA200'] = df_rich['Close'].rolling(200).mean()
-                
-                # ATR14
-                h_l = df_rich['High'] - df_rich['Low']
-                h_pc = (df_rich['High'] - df_rich['Close'].shift(1)).abs()
-                l_pc = (df_rich['Low'] - df_rich['Close'].shift(1)).abs()
-                tr = pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
-                df_rich['ATR14'] = tr.rolling(14).mean()
-                df_rich['AvgVolume20'] = df_rich['Volume'].rolling(20).mean()
-                
+                from tinvest.data_loader import enrich_dataframe
                 from tinvest.advanced_entry import classify_entry
                 from tinvest.valuation_engine import evaluate_stock_valuation
+                
+                # Enrich 1 lần duy nhất thay vì tính từng chỉ báo riêng lẻ
+                df_rich = enrich_dataframe(idx_df.copy())
                 
                 # Tính momentum trước để truyền vào regime engine
                 mom = analyze_momentum_divergence(idx_df)

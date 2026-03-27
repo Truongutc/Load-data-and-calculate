@@ -12,10 +12,10 @@ Modules:
   8. analyzer        – Single-stock full analysis
 """
 
-from .data_loader import load_data
+from .data_loader import load_data, enrich_dataframe
 from .analyzer import analyze_stock, format_report
 from .advanced_entry import classify_entry
 from .accumulation_engine import analyze_accumulation
 from .ma_engine import analyze_ma_trend
 
-__all__ = ["load_data", "analyze_stock", "format_report"]
+__all__ = ["load_data", "enrich_dataframe", "analyze_stock", "format_report"]

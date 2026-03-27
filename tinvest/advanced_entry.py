@@ -446,54 +446,13 @@ def _eval_day(df: pd.DataFrame, idx: int):
     return None
 
 def ensure_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure all required columns for signal evaluation are present."""
+    """Ensure all required columns for signal evaluation are present.
+    Delegates to enrich_dataframe() — the single source of truth.
+    If columns already exist, this is a near-zero-cost no-op.
+    """
     if len(df) < 10: return df
-    
-    # MA
-    if 'MA10' not in df.columns: df['MA10'] = df['Close'].rolling(10).mean()
-    if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
-    if 'MA50' not in df.columns: df['MA50'] = df['Close'].rolling(50).mean()
-    if 'MA100' not in df.columns: df['MA100'] = df['Close'].rolling(100).mean()
-    if 'MA200' not in df.columns: df['MA200'] = df['Close'].rolling(200).mean()
-    
-    # Ichimoku
-    if 'Tenkan' not in df.columns:
-        df['Tenkan'] = (df['High'].rolling(9).max() + df['Low'].rolling(9).min()) / 2
-    if 'Kijun' not in df.columns:
-        df['Kijun'] = (df['High'].rolling(26).max() + df['Low'].rolling(26).min()) / 2
-    if 'Kijun65' not in df.columns:
-        df['Kijun65'] = (df['High'].rolling(65).max() + df['Low'].rolling(65).min()) / 2
-    if 'SpanA' not in df.columns:
-        df['SpanA'] = ((df['Tenkan'] + df['Kijun']) / 2).shift(26)
-    if 'SpanB' not in df.columns:
-        df['SpanB'] = ((df['High'].rolling(52).max() + df['Low'].rolling(52).min()) / 2).shift(26)
-    if 'CloudTop' not in df.columns:
-        df['CloudTop'] = df[['SpanA', 'SpanB']].max(axis=1)
-    
-    # Heikin Ashi
-    if 'HA_Color' not in df.columns:
-        df_ha = calculate_ha(df)
-        df['HA_Open'] = df_ha['HA_Open']
-        df['HA_Close'] = df_ha['HA_Close']
-        df['HA_Color'] = np.where(df['HA_Close'] > df['HA_Open'], 'Green', 'Red')
-    
-    # VSA Proxy
-    if 'AvgVolume20' not in df.columns: df['AvgVolume20'] = df['Volume'].rolling(20).mean()
-    if 'Spread' not in df.columns: df['Spread'] = df['High'] - df['Low']
-    if 'Avg_Spread_20' not in df.columns: df['Avg_Spread_20'] = df['Spread'].rolling(20).mean()
-    
-    # VSA Rules
-    # VSA Rules
-    # Note: These are kept for compatibility if other parts of the code use them directly, 
-    # but the primary engine uses `get_vsa_signals`. We will update them to match roughly.
-    if 'Stopping_Vol' not in df.columns:
-        df['Stopping_Vol'] = (df['Volume'] > 1.5 * df['AvgVolume20']) & (df['Spread'] > df['Avg_Spread_20']) & (df['Close'] > df['Low'] + 0.3 * df['Spread'])
-    if 'No_Supply' not in df.columns:
-        df['No_Supply'] = (df['Volume'] < 0.7 * df['AvgVolume20']) & (df['Spread'] < df['Avg_Spread_20']) & (df['Close'] < df['Open'])
-    if 'Test_Supply' not in df.columns:
-        df['Test_Supply'] = (df['Volume'] < df['AvgVolume20']) & (df['Spread'] < df['Avg_Spread_20'] * 0.8) & (df['Close'] > df['Low'] + 0.4 * df['Spread'])
-    
-    return df
+    from .data_loader import enrich_dataframe
+    return enrich_dataframe(df)
 
 def classify_entry(df: pd.DataFrame) -> dict:
     if len(df) < 2:
