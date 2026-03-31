@@ -10,6 +10,12 @@ import os
 import pandas as pd
 import threading
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from tinvest.storage_manager import StorageManager
+from tinvest.vietstock_client import VietstockClient
+from tinvest.config_manager import ConfigManager
+import tkinter.simpledialog as simpledialog
+from tkinter import scrolledtext
+from datetime import datetime, timedelta
 
 # --- GLOBAL WORKER FOR MULTIPROCESSING ---
 def analyze_ticker_worker(ticker_df_tuple):
@@ -68,7 +74,15 @@ class TinvestApp:
         self.data_dict = {}
         self.analysis_cache = {} # Lưu kêt quả tính toán sẵn để tránh delay
         
+        # Initialize Storage and API
+        self.config_mgr = ConfigManager()
+        self.storage = StorageManager()
+        self.vs_client = VietstockClient()
+        
         self._build_ui()
+        
+        # NOTE: Auto-load on startup disabled as per request.
+        # Use the "📂 Load Dữ liệu Cũ" button instead.
 
     def _build_ui(self):
         # --- Top Frame: File Selection ---
@@ -79,8 +93,17 @@ class TinvestApp:
         self.lbl_file = tk.Label(frame_top, text="Chưa có dữ liệu (0 mã)...", fg="gray", font=("Arial", 10))
         self.lbl_file.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         
-        btn_open = tk.Button(frame_top, text="📥 Nạp Thêm File CSV", command=self.open_file, bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), padx=10)
-        btn_open.pack(side=tk.RIGHT, padx=5)
+        btn_open = tk.Button(frame_top, text="📥 Nạp Thêm CSV", command=self.open_file, bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), padx=5)
+        btn_open.pack(side=tk.RIGHT, padx=2)
+
+        btn_load = tk.Button(frame_top, text="📂 Load Dữ liệu Cũ", command=self.load_from_cache, bg="#795548", fg="white", font=("Arial", 10, "bold"), padx=5)
+        btn_load.pack(side=tk.RIGHT, padx=2)
+
+        btn_vs = tk.Button(frame_top, text="🌐 Cập Nhật Vietstock", command=self.run_vietstock_update, bg="#2196F3", fg="white", font=("Arial", 10, "bold"), padx=5)
+        btn_vs.pack(side=tk.RIGHT, padx=2)
+
+        btn_settings = tk.Button(frame_top, text="⚙️", command=self.open_settings, bg="#607D8B", fg="white", font=("Arial", 10, "bold"), padx=5)
+        btn_settings.pack(side=tk.RIGHT, padx=2)
 
         # --- Middle Frame: Action Buttons ---
         frame_mid = tk.Frame(self.root, pady=15, padx=10)
@@ -182,144 +205,335 @@ class TinvestApp:
         try:
             from concurrent.futures import ThreadPoolExecutor, as_completed
             
-            # --- parallel loading ---
-            self.log_sync(f"[1/5] Đang nạp thô {len(files)} file lên RAM (Song song)...")
-            dfs = [None] * len(files)
-            
-            def _load_one(idx, path):
+            self.log_sync(f"[1/4] Đang nạp thô {len(files)} file CSV...")
+            dfs = []
+            for f in files:
                 try:
-                    return idx, pd.read_csv(path)
-                except Exception:
-                    return idx, None
-
-            with ThreadPoolExecutor(max_workers=min(32, len(files))) as loader_exec:
-                load_futures = [loader_exec.submit(_load_one, i, f) for i, f in enumerate(files)]
-                for fut in as_completed(load_futures):
-                    i, df_raw = fut.result()
-                    if df_raw is not None:
-                        dfs[i] = df_raw
-            
-            dfs = [d for d in dfs if d is not None]
+                    dfs.append(pd.read_csv(f))
+                except: pass
             
             if not dfs:
                 self.log_sync("Lỗi: Không đọc được file nào hợp lệ.")
                 return
                 
-            self.log_sync("[2/4] Đang chuẩn hóa & Phân tách mã (Song song)...")
+            self.log_sync("[2/4] Đang chuẩn hóa & Lưu vào Storage (CSV-First)...")
+            raw_full = pd.concat(dfs, ignore_index=True)
+            df_norm = _normalize_columns(raw_full)
             
-            def _process_one_df(raw_df):
-                try:
-                    df_n = _normalize_columns(raw_df)
-                    results = []
-                    if "Ticker" in df_n.columns:
-                        grouped = df_n.groupby("Ticker")
-                        for ticker_val, group in grouped:
-                            t = str(ticker_val).upper().strip()
-                            is_idx = ("VNINDEX" in t) or ("HNX" in t) or ("HAINDEX" in t)
-                            if not (len(t) == 3 and t.isalnum()) and not is_idx:
-                                continue
-                            sub_df = group.drop(columns=["Ticker"]).copy()
-                            try:
-                                c = _clean_dataframe(sub_df, ticker=t)
-                                results.append((t, c))
-                            except: pass
-                    else:
-                        try:
-                            c = _clean_dataframe(df_n, ticker="SINGLE")
-                            results.append(("SINGLE", c))
-                        except: pass
-                    return results
-                except: return []
-
-            with ThreadPoolExecutor(max_workers=16) as proc_exec:
-                proc_futures = [proc_exec.submit(_process_one_df, d) for d in dfs]
-                for fut in as_completed(proc_futures):
-                    chunk_res = fut.result()
-                    for t, c in chunk_res:
-                        if t in self.data_dict:
-                            self.data_dict[t] = pd.concat([self.data_dict[t], c]).drop_duplicates(subset=["Date"]).sort_values("Date")
-                        else:
-                            self.data_dict[t] = c
-
-            total_valid = len(self.data_dict)
-            self.log_sync(f" ---> Hoàn tất nạp dữ liệu. Đã nhận diện {total_valid} mã hợp lệ (3 ký tự).")
+            affected_tickers = set()
+            if "Ticker" in df_norm.columns:
+                grouped = df_norm.groupby("Ticker")
+                for ticker_val, group in grouped:
+                    t = str(ticker_val).upper().strip()
+                    is_idx = ("VNINDEX" in t) or ("HNX" in t) or ("HAINDEX" in t)
+                    if not (len(t) == 3 and t.isalnum()) and not is_idx:
+                        continue
+                    
+                    sub_df = group.drop(columns=["Ticker"]).copy()
+                    try:
+                        clean_sub = _clean_dataframe(sub_df, ticker=t)
+                        # Sync with CSV priority
+                        t_min = self.storage.sync_prices(t, clean_sub, source='CSV')
+                        if t_min is not None:
+                            affected_tickers.add(t)
+                    except: pass
             
-            for k, v in self.data_dict.items():
-                self.data_dict[k] = v.sort_values(by="Date").reset_index(drop=True)
+            if not affected_tickers:
+                self.log_sync("Không có thay đổi dữ liệu nào được ghi nhận.")
+                return
 
-            self.log_sync("[3/4] Bắt đầu tính toán các chỉ báo kỹ thuật liên thị trường...")
+            self.log_sync(f"[3/4] Đã cập nhật {len(affected_tickers)} mã. Đang tính toán chỉ báo...")
+            self._sync_and_recompute_affected(list(affected_tickers))
+            
+            self.log_sync(f"\n✅ HOÀN TẤT NẠP DỮ LIỆU CSV!")
+            
+        except Exception as e:
+            self.log_sync(f"\n❌ LỖI XỬ LÝ CSV: {str(e)}")
 
-            total_compute = len(self.data_dict)
+    def open_settings(self):
+        """Mở cửa sổ cấu hình nâng cao để dán Header/cURL/URL từ trình duyệt."""
+        top = tk.Toplevel(self.root)
+        top.title("Cấu hình Vietstock nâng cao (Session/Token)")
+        top.geometry("700x580")
+        top.resizable(False, False)
+        
+        # Header Help
+        frame_help = tk.LabelFrame(top, text="💡 Hướng dẫn lấy Token (Dùng để vượt giới hạn 200 mã)", font=("Arial", 10, "bold"), padx=10, pady=10, fg="#2E7D32")
+        frame_help.pack(fill=tk.X, padx=10, pady=5)
+        
+        steps = (
+            "📌 B1: Mở [finance.vietstock.vn] -> Tab [Thống kê giá].\n"
+            "📌 B2: Nhấn [F12] -> Chọn tab [Network] (Mạng).\n"
+            "📌 B3: Lọc dữ liệu trên Web để hiện dòng 'KQGDThongKeGiaPaging'.\n"
+            "📌 B4: Chuột phải vào dòng đó -> Copy -> 'Copy Request Headers' (hoặc 'Copy as cURL').\n"
+            "   (Hệ thống hiện hỗ trợ bóc tách linh hoạt từ Headers, cURL hoặc URL).\n"
+            "📌 B5: Dán nội dung vào ô dưới và bấm Lưu."
+        )
+        tk.Label(frame_help, text=steps, justify=tk.LEFT, font=("Arial", 9)).pack(side=tk.LEFT)
+        
+        txt_area = scrolledtext.ScrolledText(top, width=80, height=15, font=("Consolas", 9))
+        txt_area.pack(padx=10, pady=5)
+        
+        # Pre-fill current status info
+        curr_token = self.config_mgr.get("payload_token") or "N/A"
+        cookies = self.config_mgr.get("cookies") or {}
+        txt_area.insert(tk.END, f"--- Trạng thái hiện tại ---\n")
+        txt_area.insert(tk.END, f"Token: {curr_token[:30]}...\n")
+        txt_area.insert(tk.END, f"Cookies: {len(cookies)} keys\n")
+        txt_area.insert(tk.END, f"\n--- Dán Header/cURL/URL mới vào đây ---\n")
+
+        def save_and_close():
+            raw_text = txt_area.get("1.0", tk.END).strip()
+            if not raw_text:
+                top.destroy()
+                return
+            
+            # Clean up previous status text if user didn't clear it
+            if "--- Dán Header/cURL/URL mới vào đây ---" in raw_text:
+                raw_text = raw_text.split("--- Dán Header/cURL/URL mới vào đây ---")[-1].strip()
+
+            success = self.config_mgr.parse_input(raw_text)
+            if success:
+                # Force client refresh
+                self.vs_client.refresh_from_config()
+                
+                new_token = self.config_mgr.get("payload_token")
+                new_cookies = self.config_mgr.get("cookies")
+                
+                msg = f"Đã nhận diện thành công!\n\n- Token: {new_token[:20]}...\n- Cookies: {len(new_cookies)} mục.\n\nHệ thống đã lưu và áp dụng ngay."
+                messagebox.showinfo("Thành công", msg)
+                self.log_sync("✅ Đã cập nhật xong Session Vietstock mới.")
+                top.destroy()
+            else:
+                messagebox.showerror("Lỗi", "Không tìm thấy Cookie hoặc Token hợp lệ. Hãy kiểm tra lại định dạng dán.")
+
+        btn_row = tk.Frame(top)
+        btn_row.pack(pady=10)
+        
+        tk.Button(btn_row, text="💾 Lưu & Cập Nhật", command=save_and_close, bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), padx=15).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_row, text="❌ Hủy", command=top.destroy, padx=15).pack(side=tk.LEFT, padx=5)
+
+    def load_from_cache(self):
+        """Trigger cache loading in background thread."""
+        self.log_sync("\n--- ĐANG TẢI DỮ LIỆU TỪ BỘ NHỚ ĐỆM (CACHE)... ---", clear=True)
+        threading.Thread(target=self._load_from_cache_bg, daemon=True).start()
+
+    def _load_from_cache_bg(self):
+        try:
+            tickers = self.storage.get_all_tickers()
+            if not tickers:
+                self.log_sync("Chưa có dữ liệu trong cache. Vui lòng bấm 'Cập Nhật Vietstock' hoặc 'Nạp Thêm CSV'.")
+                return
+
+            self.data_dict = {}
             self.analysis_cache = {}
             
-            self.log_sync(f"[5/5] CẤU TRÚC LẠI DỮ LIỆU... Đang chạy đa tiến trình ({total_compute} mã)...")
+            total = len(tickers)
+            cnt = 0
+            
+            for t in tickers:
+                # Load price
+                df = self.storage.load_ticker_data(t)
+                if df is not None:
+                    self.data_dict[t] = df
+                    
+                    # Load analysis
+                    analysis = self.storage.load_latest_analysis(t)
+                    if analysis:
+                        analysis['df'] = df
+                        self.analysis_cache[t] = analysis
+                
+                cnt += 1
+                if cnt % 50 == 0 or cnt == total:
+                    self.log_sync(f" ---> Tiến trình: Đã nạp {cnt}/{total} mã cổ phiếu...")
+
+            self._update_breadth_from_cache()
+            self.root.after(0, self.lbl_file.config, {"text": f"Dữ liệu CACHE: {len(self.analysis_cache)} mã", "fg": "blue"})
+            self.log_sync(f"✅ Hoàn tất! Đã nạp thành công {len(self.analysis_cache)} mã từ bộ nhớ đệm.")
+            
+        except Exception as e:
+            self.log_sync(f"⚠️ Lỗi khi nạp cache: {e}")
+
+    def run_vietstock_update(self):
+        """Trigger incremental update from Vietstock API."""
+        self.log_sync("\n--- BẮT ĐẦU CẬP NHẬT DỮ LIỆU TỪ VIETSTOCK API... ---", clear=True)
+        threading.Thread(target=self._vietstock_update_bg, daemon=True).start()
+
+    def _vietstock_update_bg(self):
+        try:
+            now = datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+            # If weekend, use Friday for the probe
+            probe_date = today_str
+            if now.weekday() == 5: 
+                probe_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+            elif now.weekday() == 6: 
+                probe_date = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+
+            # --- STEP 1: IMMEDIATE SESSION PROBE ---
+            self.log_sync(f"[*] Đang kiểm tra trạng thái URL (phiên thử nghiệm {probe_date})...", clear=True)
+            _, is_limited = self.vs_client.fetch_market_day(1, probe_date)
+            
+            if is_limited:
+                self.log_sync("! CẢNH BÁO: URL bị hạn chế (Chặn 200 mã). Hệ thống sẽ tự động kích hoạt chế độ nạp chia nhỏ (Bypass).")
+                self.root.after(0, lambda: messagebox.showwarning("Cảnh báo URL", "Dữ liệu Vietstock bị giới hạn (200 mã/sàn).\n\nHệ thống sẽ dùng chế độ nạp chia nhỏ để lấy đủ mã cổ phiếu, nhưng bạn nên cập nhật cURL mới trong Cài đặt (⚙) để đạt tốc độ tốt nhất."))
+            else:
+                self.log_sync("✅ URL hoạt động tốt. Bắt đầu kiểm tra tính toàn vẹn dữ liệu...")
+
+            # --- STEP 2: INTEGRITY CHECK (LAST 3 DAYS) ---
+            last_date = self.storage.get_last_date()
+            missing_dates = self.vs_client.get_missing_dates(last_date)
+            
+            check_dates = []
+            current = last_date
+            while len(check_dates) < 3 and current is not None:
+                if current.weekday() < 5:
+                    check_dates.append(current.strftime("%Y-%m-%d"))
+                current -= timedelta(days=1)
+            
+            if check_dates:
+                ticker_counts = self.storage.get_ticker_counts_for_dates(check_dates)
+                # Ngưỡng: Nếu tổng số mã < 1200, coi là ngày bị thiếu sàn và cần xóa nạp lại.
+                bad_dates = [d for d, count in ticker_counts.items() if count > 0 and count < 1200]
+                if bad_dates:
+                    self.log_sync(f"[*] Phát hiện {len(bad_dates)} ngày bị thiếu dữ liệu (< 1200 mã): {', '.join(bad_dates)}.")
+                    self.log_sync(f"[*] Tiến hành xóa dữ liệu cũ của các ngày này để nạp bù...")
+                    self.storage.delete_specific_dates(bad_dates)
+                    # Merge with missing_dates and deduplicate
+                    missing_dates = sorted(list(set(missing_dates) | set(bad_dates)))
+            # --- END: 3-DAY CLEANUP LOGIC ---
+
+            if not missing_dates:
+                self.log_sync("✅ Dữ liệu đã được cập nhật mới nhất (SSoT).")
+                self.log_sync("Gợi ý: Hãy bấm '📂 Load Dữ liệu Cũ' để nạp kết quả phân tích.")
+                return
+
+            self.log_sync(f"Tìm thấy {len(missing_dates)} ngày cần đồng bộ: {', '.join(missing_dates)}")
+            
+            affected_tickers = set()
+            
+            # --- STEP 3: FULL UPDATE ---
+            for d in missing_dates:
+                day_total = []
+                self.log_sync(f"[*] Đang tải dữ liệu ngày {d}...")
+                
+                # Fetch Markets (HOSE=1, HNX=2, UPCOM=3)
+                for cat_id, cat_name in [(1, "HOSE"), (2, "HNX"), (3, "UPCOM")]:
+                    try:
+                        raw, is_limited = self.vs_client.fetch_market_day(cat_id, d)
+                        if is_limited:
+                            self.log_sync(f"   ! CẢNH BÁO: {cat_name} bị giới hạn (200 mã).")
+                        if raw:
+                            day_total.extend(raw)
+                            self.log_sync(f"   + {cat_name}: {len(raw)} mã.")
+                    except Exception as e:
+                        self.log_sync(f"   ! Lỗi {cat_name}: {e}")
+                
+                if day_total:
+                    df_day = self.vs_client.format_to_df(day_total)
+                    total_p1 = len(day_total)
+                    self.log_sync(f"   ---> Ngày {d}: Tổng cộng nạp {total_p1} mã cổ phiếu.")
+                    
+                    if total_p1 < 1200:
+                        self.log_sync(f"   ! CẢNH BÁO: Ngày {d} bị thiếu dữ liệu ({total_p1} < 1200 mã). URL hết hạn.")
+                        
+                    # Group by Ticker and sync to storage
+                    for ticker, group in df_day.groupby("Ticker"):
+                        try:
+                            # SSoT: CSV > API is already handled inside storage.sync_prices
+                            t_min = self.storage.sync_prices(ticker, group, source='API')
+                            if t_min is not None: 
+                                affected_tickers.add(ticker)
+                        except: pass
+                
+                # Fetch Indices (VNINDEX=1, HNX-INDEX=2)
+                indices = [("VNINDEX", 1, -19), ("HNX-INDEX", 2, -18)]
+                for ticker, tid, sid in indices:
+                    try:
+                        idx_raw = self.vs_client.fetch_index_day(ticker, tid, sid, d)
+                        if idx_raw:
+                            day_idx = self.vs_client.format_to_df(idx_raw)
+                            t_min = self.storage.sync_prices(ticker, day_idx, source='API')
+                            if t_min is not None: affected_tickers.add(ticker)
+                    except: pass
+
+            if not affected_tickers:
+                self.log_sync("✅ Dữ liệu đã được cập nhật mới nhất (SSoT).")
+                self.log_sync("Gợi ý: Hãy bấm '📂 Load Dữ liệu Cũ' để nạp dữ liệu vào hệ thống phân tích.")
+                return
+
+            self.log_sync(f"✅ Hoàn tất! Đã cập nhật và đồng bộ {len(affected_tickers)} mã cổ phiếu.")
+            self.log_sync("Hệ thống đã lưu dữ liệu mới nhất. Hãy bấm '📂 Load Dữ liệu Cũ' để cập nhật kết quả phân tích!")
+            self.log_sync("Đang tính toán lại chỉ báo cho các mã bị ảnh hưởng...")
+            self._sync_and_recompute_affected(list(affected_tickers))
+
+        except Exception as e:
+            self.log_sync(f"❌ Lỗi Vietstock Update: {e}")
+
+    def _sync_and_recompute_affected(self, tickers):
+        """Standard processing logic + saving results to Storage."""
+        try:
+            # 1. Load full history for affected tickers
+            items = []
+            for t in tickers:
+                df_full = self.storage.load_ticker_data(t)
+                if df_full is not None:
+                    self.data_dict[t] = df_full
+                    items.append((t, df_full))
+            
+            total = len(items)
+            if total == 0: return
             
             cmp = 0
-            items = list(self.data_dict.items())
-            
-            # Gom nhóm (Batching): mỗi batch khoảng 20 mã để tối ưu hóa overhead tiến trình
             batch_size = 20
-            batches = [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
+            batches = [items[i:i + batch_size] for i in range(0, total, batch_size)]
             
-            import os
-            num_workers = min(os.cpu_count() or 4, 8) # Ưu tiên dùng đa nhân thực (giống analogy 8 người 8 dao)
-            
+            num_workers = min(os.cpu_count() or 4, 8)
             with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                # Giao các batch cho các tiến trình
                 futures = [executor.submit(analyze_batch_worker, b) for b in batches]
-                
                 for future in as_completed(futures):
                     batch_results = future.result()
                     for ticker, res in batch_results:
                         if res:
                             self.analysis_cache[ticker] = res
+                            # SAVE TO STORAGE
+                            self.storage.save_indicators(ticker, res['df'])
+                            self.storage.save_analysis(ticker, res)
                     
-                        cmp += 1
-                        # In tiến độ
-                        if cmp % max(10, int(total_compute*0.05)) == 0 or cmp == total_compute:
-                            self.log_sync(f" ---> Tiến độ lập chỉ mục: {cmp}/{total_compute} mã ({int(cmp/total_compute*100)}%)...")
+                    cmp += len(batch_results)
+                    self.log_sync(f" ---> Tiến độ: {cmp}/{total} mã...")
 
-            self.log_sync("[6/6] Đang cập nhật Market Breadth (Độ Rộng Thị Trường) từ KQ tính toán...")
-            breadth_dfs = []
-            
-            # Tái sử dụng MA đã tính sẵn trong df_rich (enrich_dataframe đã tính MA10/MA20/MA50)
-            for ticker, analysis in self.analysis_cache.items():
-                try:
-                    df_sub = analysis["df"]  # df_rich đã có sẵn MA10, MA20, MA50
-                    
-                    temp = pd.DataFrame()
-                    temp['Date'] = df_sub['Date']
-                    temp['Valid'] = 1
-                    # Đọc trực tiếp từ columns đã enrich, không cần tính lại
-                    temp['>MA10'] = (df_sub['Close'] > df_sub['MA10']).astype(int)
-                    temp['>MA20'] = (df_sub['Close'] > df_sub['MA20']).astype(int)
-                    temp['>MA50'] = (df_sub['Close'] > df_sub['MA50']).astype(int)
-                    
-                    breadth_dfs.append(temp)
-                except Exception:
-                    pass
-                    
-            if breadth_dfs:
-                all_breadth = pd.concat(breadth_dfs)
-                grouped = all_breadth.groupby('Date').sum()
-                
-                # Tránh chia cho 0
-                valid_counts = grouped['Valid'].replace(0, 1)
-                
-                mb = pd.DataFrame()
-                mb['%MA10'] = (grouped['>MA10'] / valid_counts) * 100
-                mb['%MA20'] = (grouped['>MA20'] / valid_counts) * 100
-                mb['%MA50'] = (grouped['>MA50'] / valid_counts) * 100
-                
-                self.market_breadth = mb.sort_index()
-            else:
-                self.market_breadth = pd.DataFrame()
+            self._update_breadth_from_cache()
+            self.root.after(0, self.lbl_file.config, {"text": f"Dữ liệu: {len(self.analysis_cache)} mã", "fg": "blue"})
+            self.log_sync("✅ Cập nhật hoàn tất!")
 
-            self.root.after(0, self.lbl_file.config, {"text": f"Đã nạp & tính toán {len(self.analysis_cache)} mã", "fg": "blue"})
-            self.log_sync(f"\n✅ HOÀN TẤT NẠP DỮ LIỆU!\nHệ thống hiện giữ lịch sử & KQ phân tích sẵn sàng của {len(self.analysis_cache)} mã chứng khoán.\nBây giờ bạn bấm LỌC sẽ ra kết quả ngay lập tức!")
-            
         except Exception as e:
-            self.log_sync(f"\n❌ GẶP LỖI TRONG QUÁ TRÌNH GHÉP FILE: {str(e)}")
+            self.log_sync(f"❌ Lỗi xử lý: {e}")
+
+    def _update_breadth_from_cache(self):
+        """Recalculate market breadth from analysis_cache."""
+        breadth_dfs = []
+        for ticker, analysis in self.analysis_cache.items():
+            try:
+                df_sub = analysis["df"]
+                temp = pd.DataFrame()
+                temp['Date'] = df_sub['Date']
+                temp['Valid'] = 1
+                temp['>MA10'] = (df_sub['Close'] > df_sub['MA10']).astype(int)
+                temp['>MA20'] = (df_sub['Close'] > df_sub['MA20']).astype(int)
+                temp['>MA50'] = (df_sub['Close'] > df_sub['MA50']).astype(int)
+                breadth_dfs.append(temp)
+            except: pass
+            
+        if breadth_dfs:
+            all_breadth = pd.concat(breadth_dfs)
+            grouped = all_breadth.groupby('Date').sum()
+            valid_counts = grouped['Valid'].replace(0, 1)
+            mb = pd.DataFrame()
+            mb['%MA10'] = (grouped['>MA10'] / valid_counts) * 100
+            mb['%MA20'] = (grouped['>MA20'] / valid_counts) * 100
+            mb['%MA50'] = (grouped['>MA50'] / valid_counts) * 100
+            self.market_breadth = mb.sort_index()
 
 
 
@@ -350,7 +564,7 @@ class TinvestApp:
             
     def run_advanced_scanner(self, entry_target: str):
         if not self.analysis_cache:
-            messagebox.showwarning("Cảnh báo", "Hệ thống chưa nạp dữ liệu. Hãy bấm 'Nạp Thêm File CSV'!")
+            messagebox.showwarning("Cảnh báo", "Hệ thống chưa nạp dữ liệu. Hãy bấm '📂 Load Dữ liệu Cũ' hoặc 'Nạp Thêm File CSV'!")
             return
             
         self.log_sync(f"Đang hiển thị các mã ứng với [{entry_target}] (thời gian tính 0ms)...", clear=True)
