@@ -2121,6 +2121,7 @@ class TinvestApp:
                         size = "N/A"
                         conf = "STRONG"
                         flags = "ADX Trắng (Rising & DI+ > DI-)"
+                        val["risk_pct"] = val.get("risk_pct", 0) * 0.7  # Relax risk for scanner display
 
 
                 else:
@@ -2147,15 +2148,9 @@ class TinvestApp:
                 if match:
 
 
-                    # Skip if risk is too high (>15%) or invalid data
-
-
-                    # (Nâng từ 10% lên 15% để phù hợp với các mã biến động mạnh - Penny/Midcap)
-
-
-                    if not val.get("is_valid") or val.get("risk_pct", 0) > 15.0:
-
-
+                    # Skip if risk is too high or invalid data
+                    risk_limit = 20.0 if entry_target == "WHITE_ADX" else 15.0
+                    if not val.get("is_valid") or val.get("risk_pct", 0) > risk_limit:
                         continue 
 
 
@@ -2165,7 +2160,14 @@ class TinvestApp:
                     time_lbl = "T0" if entry_target in ["ACCUMULATION", "PERFECT_MA"] else ("T-1" if any("T-1" in flag for flag in res.get("risk_flags", [])) else "T0")
 
 
-                    reason = f"Tích Lũy ({accum.get('base_quality', '')})" if entry_target == "ACCUMULATION" else ("Full MA Up" if entry_target == "PERFECT_MA" else res.get("details", {}).get("source", "System"))
+                    if entry_target == "ACCUMULATION":
+                        reason = f"Tích Lũy ({accum.get('base_quality', '')})"
+                    elif entry_target == "PERFECT_MA":
+                        reason = "Full MA Up"
+                    elif entry_target == "WHITE_ADX":
+                        reason = "ADX TRẮNG"
+                    else:
+                        reason = res.get("details", {}).get("source", "System")
 
 
                     
@@ -3181,47 +3183,51 @@ class TinvestApp:
 
 
             fig, ax1 = plt.subplots(figsize=(14, 8))
-
-
-            ax1.plot(dates, df_plot['%MA20_smooth'], color='blue', label='% Cổ phiếu > MA20')
-
-
-            ax1.plot(dates, df_plot['%MA50_smooth'], color='purple', label='% Cổ phiếu > MA50')
-
-
             
+            # --- Primary Axis: Breadth (%) ---
+            line1, = ax1.plot(dates, df_plot['%MA20_smooth'], color='#2196F3', linewidth=2, label='% Cổ phiếu > MA20')
+            line2, = ax1.plot(dates, df_plot['%MA50_smooth'], color='#9C27B0', linewidth=2, label='% Cổ phiếu > MA50')
+            
+            # Add latest value annotations
+            last_date = dates[-1]
+            val20 = df_plot['%MA20_smooth'].iloc[-1]
+            val50 = df_plot['%MA50_smooth'].iloc[-1]
+            
+            ax1.annotate(f" {val20:.1f}%", xy=(last_date, val20), xytext=(8, -5), textcoords='offset points', 
+                         color='#1976D2', fontweight='bold', fontsize=11)
+            ax1.annotate(f" {val50:.1f}%", xy=(last_date, val50), xytext=(8, 5), textcoords='offset points', 
+                         color='#7B1FA2', fontweight='bold', fontsize=11)
 
-
-            ax1.set_title('Độ Rộng Thị Trường VNINDEX')
-
-
+            ax1.set_title('BIỂU ĐỒ ĐỘ RỘNG THỊ TRƯỜNG & VNINDEX', fontsize=14, fontweight='bold', pad=20)
             ax1.set_xlabel('Thời Gian')
+            ax1.set_ylabel('Tỉ Lệ Độ Rộng (%)', fontsize=10, fontweight='bold')
+            ax1.set_ylim(0, 100)
+            ax1.grid(True, linestyle='--', alpha=0.4)
 
-
-            ax1.set_ylabel('Tỉ Lệ (%)')
-
-
-            ax1.grid(True, linestyle='--', alpha=0.6)
-
-
-            ax1.legend(loc='upper left')
-
-
-            
-
+            # --- Secondary Axis: VNINDEX Price ---
+            vn_key = next((k for k in self.data_dict.keys() if "VNINDEX" in k), "VNINDEX")
+            df_vn = self.data_dict.get(vn_key)
+            if df_vn is not None and not df_vn.empty:
+                # Align VNINDEX data with the plot dataframe dates
+                df_vn_plot = df_vn.loc[df_vn.index.isin(df_plot.index)]
+                if not df_vn_plot.empty:
+                    ax2 = ax1.twinx()
+                    line3, = ax2.plot(dates, df_vn_plot['Close'], color='grey', alpha=0.35, 
+                                     linestyle='--', linewidth=1.5, label='VNINDEX (Price)')
+                    ax2.set_ylabel('Điểm số VNINDEX', color='grey', fontsize=10)
+                    ax2.tick_params(axis='y', labelcolor='grey')
+                    
+                    # Combine legends
+                    lines = [line1, line2, line3]
+                    labels = [l.get_label() for l in lines]
+                    ax1.legend(lines, labels, loc='upper left', frameon=True, shadow=True)
+            else:
+                ax1.legend(loc='upper left', frameon=True, shadow=True)
 
             ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m/%Y'))
-
-
             fig.autofmt_xdate()
-
-
             
-
-
             plt.tight_layout()
-
-
             plt.show()
 
 
