@@ -18,12 +18,12 @@ class VietstockClient:
         self.index_api_url = self.config_mgr.get("vietstock_index_url")
         self.stocklist_api_url = self.config_mgr.get("stocklist_api_url")
         
+        self.session_limited = False # Track if current token is restricted to 200 items
         self.session = requests.Session()
         # Initialize headers from config
-        # Improved headers from reference project
         self.session.headers.update(self.config_mgr.get("headers"))
         self.session.headers.update({
-            "Referer": f"{self.base_url}/ket-qua-giao-dich?tab=thong-ke-gia", # Base referer
+            "Referer": f"{self.base_url}/ket-qua-giao-dich?tab=thong-ke-gia",
             "Origin": self.config_mgr.get("headers").get("Origin", self.base_url)
         })
         
@@ -31,16 +31,9 @@ class VietstockClient:
         cookies = self.config_mgr.get("cookies")
         if cookies:
             self.session.cookies.update(cookies)
-            logger.info("Injected session cookies from config.")
         
         # Priority token from payload config
         self.manual_token = self.config_mgr.get("payload_token")
-        
-        # Load cookies if they exist
-        cookies = self.config_mgr.get("cookies")
-        if cookies:
-            self.session.cookies.update(cookies)
-            
         self.token = None
 
     def refresh_from_config(self):
@@ -50,18 +43,84 @@ class VietstockClient:
         self.index_api_url = self.config_mgr.get("vietstock_index_url")
         self.stocklist_api_url = self.config_mgr.get("stocklist_api_url")
         
-        # Update session headers
-        self.session.headers.update(self.config_mgr.get("headers"))
+        # Update session headers - Sync all tracked headers
+        conf_headers = self.config_mgr.get("headers") or {}
+        for k, v in conf_headers.items():
+            if v and v.strip():
+                self.session.headers[k] = v
         
         # Clear and Update session cookies
         self.session.cookies.clear()
         cookies = self.config_mgr.get("cookies")
         if cookies:
             self.session.cookies.update(cookies)
+        else:
+            # If no cookies, we must fetch a fresh session from the landing page
+            logger.info("No cookies found in config. Fetching fresh session...")
+            self.ensure_valid_session()
             
         # Update priority token
         self.manual_token = self.config_mgr.get("payload_token")
-        logger.info("Session refreshed with new credentials from config.")
+        self.session_limited = False # Reset status for new probe
+        logger.info("Session refreshed from config with all headers.")
+
+    def ensure_valid_session(self):
+        """Visit landing page to get fresh ASP.NET_SessionId and __RequestVerificationToken cookies."""
+        try:
+            url = f"{self.base_url}/ket-qua-giao-dich?tab=thong-ke-gia"
+            # We use a clean GET to the landing page to populate cookies
+            resp = self.session.get(url, timeout=10)
+            if resp.status_code == 200:
+                # Save captured cookies back to config manager for persistence
+                current_cookies = requests.utils.dict_from_cookiejar(self.session.cookies)
+                if current_cookies:
+                    self.config_mgr.set("cookies", current_cookies)
+                    logger.info(f"Automatically captured {len(current_cookies)} cookies.")
+                return True
+        except Exception as e:
+            logger.error(f"Failed to ensure valid session: {e}")
+        return False
+
+    def check_session_status(self, date_str=None):
+        """Perform a small probe to check if the session is currently limited."""
+        if not date_str:
+            now = datetime.now()
+            date_str = now.strftime("%Y-%m-%d")
+            # Weekend handling
+            if now.weekday() == 5: date_str = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+            elif now.weekday() == 6: date_str = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+            
+        try:
+            # OPTIMIZED PROBE: Request exactly 201 items.
+            # If server returns 200, it's limited. If 201, it's full.
+            # This is 10x faster than requesting 2000 items.
+            raw = self._fetch_page(1, date_str, page=1, page_size=201)
+            if not raw or not isinstance(raw, list) or len(raw) < 3:
+                return "ERROR"
+            
+            stocks = raw[2]
+            if not stocks: return "NO_DATA"
+            
+            if len(stocks) == 200:
+                self.session_limited = True
+                
+                # TEST BYPASS: Explicitly try to fetch records beyond 200
+                bypass_size = self.config_mgr.get("bypass_pageSize") or 50
+                if not bypass_size or bypass_size >= 200:
+                    bypass_size = 50
+                    
+                test_page = max(2, (200 // bypass_size) + 1)
+                test_raw = self._fetch_page(1, date_str, page=test_page, page_size=bypass_size)
+                
+                if test_raw and isinstance(test_raw, list) and len(test_raw) >= 3 and test_raw[2]:
+                     return "LIMITED_BYPASSED" # Bypass works! We can get > 200 items.
+                else:
+                     return "LIMITED" # TRULY BLOCKED. Bypass failed to get more items.
+            
+            self.session_limited = False
+            return "VALID"
+        except Exception:
+            return "ERROR"
 
     def get_token(self):
         """Fetch __RequestVerificationToken from Vietstock landing page."""
@@ -167,13 +226,19 @@ class VietstockClient:
             logger.warning(f"Vietstock API truncated to 200 items. Triggering auto-bypass for Cat {cat_id}...")
             is_limited = True
             
-            # BYPASS STRATEGY: Use small pageSize (50) to fetch all pages. 
-            # This often bypasses the 200-per-request limit.
+            # BYPASS STRATEGY: Use dynamically calculated pageSize from user's URL or fallback to 50
+            bypass_size = self.config_mgr.get("bypass_pageSize") or 50
+            if not bypass_size or bypass_size >= 200: 
+                bypass_size = 50 # Fallback safety
+                
+            logger.info(f"Using dynamic auto-bypass with pageSize={bypass_size}")
+            
             all_data = []
-            # We assume total items might be up to 1000 for safety (HOSE has ~425)
-            # Fetch at least 20 pages (20 * 50 = 1000)
-            for p in range(1, 21):
-                page_raw = self._fetch_page(cat_id, date_str, page=p, page_size=50)
+            # We assume total items might be around 1000 for safety
+            max_pages = max(20, (2000 // bypass_size) + 2)
+            
+            for p in range(1, max_pages):
+                page_raw = self._fetch_page(cat_id, date_str, page=p, page_size=bypass_size)
                 if page_raw and isinstance(page_raw, list) and len(page_raw) >= 3:
                     p_stocks = page_raw[2]
                     if not p_stocks: break # No more data
@@ -184,8 +249,8 @@ class VietstockClient:
                         if s.get("StockCode") not in existing_tickers:
                             all_data.append(s)
                     
-                    # If this small page is also truncated to something small (e.g. 20), we stop
-                    if len(p_stocks) < 50: break
+                    # If this small page returned fewer than requested, we are properly at the end
+                    if len(p_stocks) < bypass_size: break
                 else:
                     break
                 time.sleep(0.3)
@@ -213,6 +278,12 @@ class VietstockClient:
 
     def fetch_index_day(self, ticker, cat_id, stock_id, date_str):
         """Fetch index data for a given date."""
+        self.refresh_from_config()
+        token_to_use = self.manual_token if self.manual_token else self.token
+        if not token_to_use:
+             self.get_token()
+             token_to_use = self.token
+             
         payload = {
             "page": 1,
             "pageSize": 20,
@@ -220,7 +291,7 @@ class VietstockClient:
             "stockID": stock_id,
             "fromDate": date_str,
             "toDate": date_str,
-            "__RequestVerificationToken": self.token
+            "__RequestVerificationToken": token_to_use
         }
         
         try:
@@ -232,7 +303,7 @@ class VietstockClient:
                     formatted = []
                     for r in records:
                         formatted.append({
-                            "Ticker": ticker,
+                            "StockCode": ticker, # Use StockCode so format_to_df renames it correctly
                             "TradingDate": date_str,
                             "OpenPrice": r.get("OpenPrice", 0),
                             "HighestPrice": r.get("HighestPrice", 0),
@@ -277,8 +348,14 @@ class VietstockClient:
                 'ClosePrice': 'Close',
                 'M_TotalVol': 'Volume'
             })
-            for col in ['Open', 'High', 'Low', 'Close']:
-                df[col] = df[col] / 1000.0
+            # Convert prices to thousands ONLY for stocks. 
+            # Indices like VNINDEX/HNX-INDEX are already in the correct unit.
+            is_index = df['Ticker'].iloc[0] in ['VNINDEX', 'HNX-INDEX'] if not df.empty else False
+            
+            if not is_index:
+                for col in ['Open', 'High', 'Low', 'Close']:
+                    if col in df.columns:
+                        df[col] = df[col] / 1000.0
             
             def parse_ms_date(d):
                 if not isinstance(d, str): return d

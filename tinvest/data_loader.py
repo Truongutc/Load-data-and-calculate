@@ -71,7 +71,70 @@ def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     out['HA_Close'] = ha_close
     out['HA_Color'] = np.where(ha_close > ha_open, 'Green', 'Red')
 
-    # ── 6. VSA Helpers ─────────────────────────────────────────────────────
+    # ── 6. RSI (Relative Strength Index) ──────────────────────────────────
+    delta = out['Close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    
+    # Use Wilder's smoothing/EWM
+    avg_gain = gain.ewm(com=13, adjust=False).mean()
+    avg_loss = loss.ewm(com=13, adjust=False).mean()
+    
+    rs = avg_gain / (avg_loss + 1e-10)
+    out['RSI'] = 100 - (100 / (1 + rs))
+
+    # ── 7. MACD (Moving Average Convergence Divergence) ───────────────────
+    ema12 = out['Close'].ewm(span=12, adjust=False).mean()
+    ema26 = out['Close'].ewm(span=26, adjust=False).mean()
+    out['MACD'] = ema12 - ema26
+    out['MACD_Signal'] = out['MACD'].ewm(span=9, adjust=False).mean()
+    out['MACD_Hist'] = out['MACD'] - out['MACD_Signal']
+    
+    # ── 8. ADX (Average Directional Index) ────────────────────────────────
+    # Period = 14
+    period = 14
+    plus_dm = (out['High'] - out['High'].shift(1)).clip(lower=0)
+    minus_dm = (out['Low'].shift(1) - out['Low']).clip(lower=0)
+    
+    # +DM only if > -DM, else 0
+    plus_dm = np.where((plus_dm > minus_dm), plus_dm, 0)
+    minus_dm = np.where((minus_dm > plus_dm), minus_dm, 0)
+    
+    tr1 = out['High'] - out['Low']
+    tr2 = (out['High'] - out['Close'].shift(1)).abs()
+    tr3 = (out['Low'] - out['Close'].shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    # Wilder's Smoothing (RMA)
+    tr_smoothed = tr.ewm(com=period-1, adjust=False).mean()
+    plus_di = 100 * (pd.Series(plus_dm).ewm(com=period-1, adjust=False).mean() / tr_smoothed)
+    minus_di = 100 * (pd.Series(minus_dm).ewm(com=period-1, adjust=False).mean() / tr_smoothed)
+    
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
+    out['ADX'] = dx.ewm(com=period-1, adjust=False).mean()
+    out['DI_Plus'] = plus_di
+    out['DI_Minus'] = minus_di
+
+    # ── 9. Pivot (Swing) Points (Fractal n=2) ───────────────────────────
+    # We find peaks/valleys to identify potential S/R
+    highs = out['High'].values
+    lows = out['Low'].values
+    n = 2
+    swing_highs = np.zeros(len(out))
+    swing_lows = np.zeros(len(out))
+    
+    for i in range(n, len(out) - n):
+        # Swing High
+        if highs[i] == max(highs[i-n:i+n+1]):
+            swing_highs[i] = highs[i]
+        # Swing Low
+        if lows[i] == min(lows[i-n:i+n+1]):
+            swing_lows[i] = lows[i]
+            
+    out['SwingHigh'] = swing_highs
+    out['SwingLow'] = swing_lows
+
+    # ── 10. VSA Helpers ─────────────────────────────────────────────────────
     out['Spread'] = out['High'] - out['Low']
     out['Avg_Spread_20'] = out['Spread'].rolling(20).mean()
     

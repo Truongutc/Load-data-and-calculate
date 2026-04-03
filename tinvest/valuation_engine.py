@@ -23,10 +23,20 @@ def _get_indicators(df: pd.DataFrame) -> dict:
         "span_a": float(last['SpanA']),
         "span_b": float(last['SpanB']),
         "cloud_top": float(max(last['SpanA'], last['SpanB'])),
-        "low10": float(df['Low'].iloc[-10:].min()),
-        "low20": float(df['Low'].iloc[-20:].min()), # Base Low
-        "hh10": float(df['High'].iloc[-10:].max())
+        "cloud_bottom": float(min(last['SpanA'], last['SpanB'])),
+        "rsi": float(last.get('RSI', 50)),
+        "macd": float(last.get('MACD', 0)),
+        "macd_hist": float(last.get('MACD_Hist', 0)),
+        "adx": float(last.get('ADX', 0)),
+        "di_plus": float(last.get('DI_Plus', 0)),
+        "di_minus": float(last.get('DI_Minus', 0))
     }
+
+def _find_swing_points(df: pd.DataFrame, n: int = 2) -> dict:
+    """Extract confirmed Swing Highs and Swing Lows from the enriched dataframe."""
+    sh = df[df['SwingHigh'] > 0]['SwingHigh'].tolist()
+    sl = df[df['SwingLow'] > 0]['SwingLow'].tolist()
+    return {"peaks": sh, "valleys": sl}
 
 def _get_entry_levels(df: pd.DataFrame) -> dict:
     """Scan last 20 bars for signals and their levels."""
@@ -59,423 +69,230 @@ def _classify_position(price: float, levels: dict) -> str:
         return "Nằm dưới điểm mua sớm"
     return "Chưa có tín hiệu mua"
 
-def _determine_state(p: float, inds: dict) -> str:
-    m20, m50 = inds["ma20"], inds["ma50"]
-    tk, kj, ct = inds["tenkan"], inds["kijun"], inds["cloud_top"]
-    k65 = inds["k65"]
-    
-    is_strong = (p > m20 > m50) and (p > ct) and (tk > kj) and (p > k65)
-    is_uptrend = (p > m20) and not is_strong
-    is_sideway = (inds["span_b"] >= p >= inds["span_a"]) or (abs(p - m20) / m20 < 0.02)
-    is_downtrend = (p < m20) and (tk < kj)
-    
-    if is_strong: return "STRONG_UPTREND"
-    if is_uptrend: return "UPTREND"
-    if is_downtrend: return "DOWNTREND"
-    return "SIDEWAY"
+def _determine_state(p: float, inds: dict, entry_type: str) -> str:
+    """Determine UI friendly state name."""
+    if entry_type == "STRONG": return "TRẠNG THÁI D: MUA MẠNH"
+    if entry_type == "ADD_2": return "TRẠNG THÁI C: GIA TĂNG 2"
+    if entry_type == "ADD_1": return "TRẠNG THÁI B: GIA TĂNG 1"
+    if entry_type == "EARLY": return "TRẠNG THÁI A: MUA SỚM"
+    return "TRẠNG THÁI 0: THEO DÕI"
 
-def _get_nearest_peak(df, idx=None, lookback=10):
-    if idx is None: idx = -1
-    if len(df) < lookback: return float(df['High'].max())
-    return float(df['High'].iloc[-lookback:].max())
-
-def _get_nearest_valley(df, idx=None, lookback=10):
-    if idx is None: idx = -1
-    if len(df) < lookback: return float(df['Low'].min())
-    return float(df['Low'].iloc[-lookback:].min())
-
-def _get_second_nearest_peak(df, idx=None, lookback1=10, lookback2=20):
-    if idx is None: idx = -1
-    if len(df) < lookback2: return _get_nearest_peak(df, idx, lookback1)
-    return float(df['High'].iloc[-lookback2:-lookback1].max())
-
-def _calculate_exits_and_sr(df, inds: dict, entry_info: dict) -> dict:
+def _calculate_exits_and_sr(df: pd.DataFrame, inds: dict, entry_info: dict) -> dict:
     p = inds["price"]
     entry_type = entry_info.get("entry_type", "NONE")
-    source = entry_info.get("details", {}).get("source", "UNKNOWN")
     
-    last = df.iloc[-1]
-    
-    nearest_peak = _get_nearest_peak(df, -1, 10)
-    second_peak = _get_second_nearest_peak(df, -1, 10, 20)
-    if second_peak < p: second_peak = nearest_peak * 1.05
-    nearest_valley = _get_nearest_valley(df, -1, 10)
-    short_term_valley = _get_nearest_valley(df, -1, 5)
-    
-    ma10 = inds['ma10']
-    ma20 = inds['ma20']
-    ma50 = inds['ma50']
-    tk = inds['tenkan']
-    kj = inds['kijun']
-    k65 = inds['k65']
-    cloud_top = inds['cloud_top']
-    cloud_bottom = min(inds['span_a'], inds['span_b'])
-    price_above_cloud = p > cloud_top
-    price_below_cloud = p < cloud_bottom
+    # Get Pivot Points
+    swings = _find_swing_points(df)
+    peaks = swings["peaks"]
+    valleys = swings["valleys"]
     
     # Defaults
-    r1, r2, s1, s2 = p * 1.05, p * 1.10, p * 0.95, p * 0.90
-    tp, ts, sl, sell_all = p * 1.05, p * 0.95, p * 0.95, p * 0.90
+    s1, s2, r1, r2, r3 = 0.0, 0.0, 0.0, 0.0, 0.0
+    tp, sl, ts = 0.0, 0.0, 0.0
     
-    if entry_type == "EARLY":
-        if source == "MA":
-            r1 = nearest_peak
-            r2 = second_peak
-            s1 = ma10
-            s2 = ma20
-            # SL1: thủng max( S1 giảm ~2.5% và giá hiện tại - 7% và đáy cũ gần nhất)
-            sl = max(s1 * 0.975, p * 0.93, nearest_valley)
-            # SL2: thủng min ( S1 giảm 2.5%, giá hiện tại -7%, đáy gần nhất)
-            sell_all = min(s1 * 0.975, p * 0.93, nearest_valley)
-            tp = r1
-            ts = min(r1, p * 1.10)
-            
-        elif source == "ICHIMOKU":
-            if price_below_cloud:
-                r1 = min(kj, k65, cloud_top if cloud_top > p else float('inf'))
-                r2 = max(kj, k65)
-                s1 = tk
-                s2 = nearest_valley
-                tp = r1
-                ts = min(r1 * 0.97, p * 1.07)
-                # Cắt lỗ max (Tenkan giảm 2.5% và đáy cũ)
-                sl = max(tk * 0.975, nearest_valley)
-                sell_all = min(tk * 0.975, nearest_valley)
-            else: # trên mây
-                r1 = nearest_peak
-                r2 = second_peak
-                s1 = max(k65, tk)
-                s2 = min(k65, tk)
-                tp = r1
-                ts = min(r1, p * 1.10)
-                sl = s1 * 0.975
-                sell_all = s2 * 0.975
-        else: # VSA
-            # Logic VSA Early Exit
-            stop_low = nearest_valley
-            stop_mid = (p + nearest_valley) / 2
-            
-            # Tìm nến Stopping Volume / Selling Climax trong 30 phiên
-            from .advanced_entry import get_vsa_signals
-            for i in range(1, 31):
-                if len(df) < i+1: break
-                v_past = get_vsa_signals(df, -i)
-                if v_past.get('stopping') or v_past.get('sc'):
-                    stop_low = float(df['Low'].iloc[-i])
-                    stop_mid = (float(df['High'].iloc[-i]) + float(df['Low'].iloc[-i])) / 2
-                    break
-            
-            # S1: Hỗ trợ động (Low Test Supply gần nhất hoặc Mid Stopping)
-            v_now = get_vsa_signals(df, -1)
-            s1 = float(df['Low'].iloc[-1]) if v_now.get('test_supply') or v_now.get('no_supply') else stop_mid
-            s2 = stop_low # Hỗ trợ sống còn
-            
-            r1 = nearest_peak
-            r2 = second_peak
-            
-            tp = r1
-            sl = s1
-            sell_all = s2
-            ts = s1 # Trailing Stop ban đầu = S1
+    # Helper to get N-th peak/valley back from price
+    v_low_vals = sorted([v for v in valleys if v < p], reverse=True)
+    v_high_peaks = sorted([v for v in peaks if v > p])
 
-    elif entry_type in ["ADD_1", "ADD_2"]:
-        if source == "MA_PULLBACK":
-            r1 = nearest_peak
-            r2 = second_peak
-            s1 = ma20
-            s2 = ma50
-            tp = r1
-            ts = min(p * 1.10, r1)
-            sl = ma20 * 0.97
-            sell_all = ma50 * 0.97
-        elif source == "MA_CROSS" or source == "MA":
-            r1 = nearest_peak
-            r2 = second_peak
-            s1 = ma20
-            s2 = ma50
-            tp = r1
-            ts = min(p * 1.10, r1)
-            if p < kj: ts = min(ts, kj)
-            sl = ma20 * 0.97
-            sell_all = ma50 * 0.97
-        elif source == "ICHIMOKU":
-            if price_below_cloud:
-                r1 = min(k65, cloud_top, nearest_peak)
-                r2 = min(nearest_peak, cloud_top)
-                s1 = tk
-                s2 = kj
-                tp = r1
-                ts = min(p * 1.10, r1)
-                sl = max(s1 * 0.97, p * 0.90)
-                sell_all = kj * 0.95
-            else: # Trên mây
-                r1 = nearest_peak
-                r2 = second_peak
-                s1 = max(k65 if k65 < p else 0, tk)
-                s2_candidates = [v for v in (k65 if k65 < p else float('inf'), ma20, kj) if v > 0]
-                s2 = min(s2_candidates) if s2_candidates else min(ma20, kj)
-                tp = r1
-                ts = min(r1 * 0.97, p * 1.10)
-                sl = s1 * 0.97
-                sell_all = cloud_top if p > cloud_top else cloud_bottom
-        else:
-            r1 = nearest_peak
-            r2 = second_peak
-            s1 = ma20
-            s2 = ma50
-            tp = r1
-            ts = ma20
-            sl = ma20 * 0.97
-            sell_all = ma50 * 0.97
-
-    elif entry_type == "STRONG":
-        # Tìm đỉnh cao nhất 1 năm (250 phiên) cho R1
-        lookback_1y = df.iloc[-250:] if len(df) >= 250 else df
-        r1_1y = float(lookback_1y['High'].max())
-        
-        # Higher Low (Đáy cao nhất trong 10 phiên)
-        higher_low = float(df['Low'].iloc[-10:].max())
-        
-        if source == "MA":
-            r1 = r1_1y
-            r2 = max(p * 1.15, p * 1.20, second_peak)
-            s1 = ma10
-            s2 = ma20
-            tp = r1
-            ts = max(ma10, kj, tk, higher_low)
-            sl = max(s1 * 0.95, p * 0.90)
-            sell_all = s2 * 0.97
-        elif source == "ICHIMOKU":
-            r1 = r1_1y
-            # R2: mốc lợi nhuận +15%, +20% hoặc đỉnh lịch sử
-            r2 = max(p * 1.15, p * 1.20, second_peak)
-            
-            # S1 = Tenkan hoặc MA10 (cái cao hơn)
-            s1 = max(tk, ma10)
-            # S2 = Kijun (quan trọng nhất)
-            s2 = kj
-            
-            tp = r1
-            # Trailing = max(MA10, Kijun, HigherLow, tenkan)
-            ts = max(ma10, kj, tk, higher_low)
-            
-            # SL1 (Cảnh báo): max (MA10 - 5% hoặc Giá mua - 10% hoặc Tenkan - 5%)
-            sl = max(ma10 * 0.95, p * 0.90, tk * 0.95)
-            # SL2: max (MA20 - 3% và Kijun - 3%)
-            sell_all = max(ma20 * 0.97, kj * 0.97)
-        else:
-            r1 = r1_1y
-            r2 = second_peak
-            s1 = ma10
-            s2 = ma20
-            tp = r1
-            ts = ma10
-            sl = ma10 * 0.95
-            sell_all = ma20 * 0.95
-    else: # NONE hoặc không có tín hiệu
-        r1 = nearest_peak
-        r2 = second_peak
-        s1 = max(ma20, tk)
-        s2 = ma50
+    # --- STATE 0: NONE ---
+    if entry_type == "NONE":
+        s1 = v_low_vals[0] if v_low_vals else p * 0.95
+        r1 = v_high_peaks[0] if v_high_peaks else p * 1.05
         tp = r1
-        ts = ma20
-        sl = s1 * 0.95
-        sell_all = s2 * 0.95
+        sl = s1
 
-    # Safe bounds
-    if r1 <= p: r1 = p * 1.05
-    if r2 <= r1: r2 = r1 * 1.05
-    if tp <= p: tp = r1
+    # --- STATE A: EARLY ---
+    elif entry_type == "EARLY":
+        s1 = v_low_vals[0] if v_low_vals else p * 0.95
+        r1 = v_high_peaks[0] if v_high_peaks else p * 1.10
+        tp = r1
+        sl = s1
+
+    # --- STATE B: ADD_1 ---
+    elif entry_type == "ADD_1":
+        r1 = v_high_peaks[0] if v_high_peaks else p * 1.10
+        r2 = v_high_peaks[1] if len(v_high_peaks) >= 2 else r1 * 1.07
+        s1 = max(inds["ma20"], inds["kijun"])
+        tp = r2
+        sl = s1
+
+    # --- STATE C: ADD_2 ---
+    elif entry_type == "ADD_2":
+        r1 = v_high_peaks[0] if v_high_peaks else p * 1.10
+        r2 = v_high_peaks[1] if len(v_high_peaks) >= 2 else r1 * 1.07
+        r3 = v_high_peaks[2] if len(v_high_peaks) >= 3 else r2 * 1.10
+        s1 = max(inds["kijun"], inds["span_a"])
+        tp = r3
+        sl = s1
+
+    # --- STATE D: STRONG ---
+    elif entry_type == "STRONG":
+        s1 = inds["ma10"]
+        # TP: Athena or Fibo 127.2%
+        r1 = v_high_peaks[0] if v_high_peaks else p * 1.127
+        tp = r1
+        sl = s1
+
+    # Fallbacks and TP/SL adjustments
+    if tp <= p: tp = p * 1.10
     if sl >= p: sl = p * 0.95
-    if sell_all >= sl: sell_all = sl * 0.98
+    ts = s1 # ADX Strong Trend uses S1/MA10 as trailing stop
     
     return {
-        "s1": float(s1), "s2": float(s2), "r1": float(r1), "r2": float(r2),
-        "tp1": float(tp), "tp2": float(r2 * 0.98),
+        "s1": float(s1), "s2": float(s1 * 0.95), "r1": float(r1), "r2": float(r2),
+        "tp1": float(tp), "tp2": float(r2 if r2 > 0 else tp * 1.10),
         "trailing_stop": float(ts),
         "cutloss_partial": float(sl),
-        "cutloss_full": float(sell_all),
-        "break_buy": float(r1 * 1.01)
+        "cutloss_full": float(sl * 0.98),
+        "break_buy": float(r1 * 1.01) if r1 > 0 else float(p * 1.05)
+    }
+
+def _evaluate_technical_health(df: pd.DataFrame, inds: dict) -> dict:
+    """
+    Diagnostic tool to evaluate stock health using ADX, RSI, and MACD.
+    Does not change trading state, only provides health insights.
+    """
+    # 1. ADX Analysis (Trend Strength)
+    adx = inds["adx"]
+    p_adx = df['ADX'].iloc[-2] if len(df) > 1 else adx
+    adx_rising = adx > p_adx
+    
+    adx_desc = "Xu hướng yếu (Sideway)"
+    if adx > 25: adx_desc = "Xu hướng mạnh"
+    if adx > 40: adx_desc = "Xu hướng cực mạnh (Quá mua/Bán)"
+    adx_status = f"{adx_desc} [{'Tăng' if adx_rising else 'Giảm'}]"
+    
+    # 2. RSI Analysis (Momentum)
+    rsi = inds["rsi"]
+    rsi_desc = "Trung tính"
+    if rsi > 60: rsi_desc = "Xung lực tăng mạnh"
+    elif rsi > 50: rsi_desc = "Xung lực tăng nhẹ"
+    elif rsi < 30: rsi_desc = "Quá bán (Dưới 30)"
+    elif rsi < 40: rsi_desc = "Xung lực yếu"
+    rsi_status = f"{rsi_desc} ({rsi:.1f})"
+    
+    # 3. MACD Analysis (Direction)
+    hist = inds["macd_hist"]
+    p_hist = df['MACD_Hist'].iloc[-2] if len(df) > 1 else hist
+    hist_rising = hist > p_hist
+    macd_status = "Tích cực (Histogram tăng)" if hist_rising else "Tiêu cực (Histogram giảm)"
+    if inds["macd"] > 0 and inds["macd_hist"] > 0:
+        macd_status = "Đà tăng mạnh (MACD > 0 & Hist > 0)"
+
+    # 4. Combined Technical Health
+    score = 0
+    if adx > 20 and adx_rising: score += 1
+    if rsi > 50: score += 1
+    if hist_rising: score += 1
+    if inds["macd"] > 0: score += 1
+    
+    health_label = "YẾU"
+    if score >= 4: health_label = "RẤT KHỎE"
+    elif score >= 3: health_label = "KHỎE"
+    elif score >= 2: health_label = "CẢI THIỆN"
+    
+    return {
+        "adx_label": adx_status,
+        "rsi_label": rsi_status,
+        "macd_label": macd_status,
+        "health_rating": health_label,
+        "health_score": score
     }
 
 def _calculate_risk_score(df: pd.DataFrame, inds: dict, exits: dict) -> dict:
     p = inds["price"]
     score = 0
-    
     last = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else last
+    prev_macd_hist = float(prev.get('MACD_Hist', 0))
     
-    # 1. TREND STATE (Đo độ yếu xu hướng, Max 30)
     score_trend = 0
     if p < inds["ma20"]: score_trend += 8
     if inds["tenkan"] < inds["kijun"]: score_trend += 8
-    
-    cloud_bottom = min(inds["span_a"], inds["span_b"])
-    if p < cloud_bottom:
-        score_trend += 15
-    elif p <= inds["cloud_top"]:  # Trong mây
-        score_trend += 10
-        
+    if p < inds["cloud_bottom"]: score_trend += 15
+    elif p <= inds["cloud_top"]: score_trend += 10
     score += min(30, score_trend)
     
-    # 2. STRUCTURE (Xương sống hệ thống, Max 35)
     score_structure = 0
     if p < inds["kijun"]: score_structure += 10
     if p < inds["k65"]: score_structure += 20
-    
-    swing_low = float(df['Low'].iloc[-50:-1].min()) if len(df) >= 50 else float(df['Low'][:-1].min())
-    if p < swing_low:
-        score_structure += 15
-        
     score += min(35, score_structure)
     
-    # 3. VOLUME / DÒNG TIỀN (Max 25)
     score_vsa = 0
-    
     vol_dist = (last['Close'] < prev['Close']) and (last['Volume'] > prev['Volume'])
-    if vol_dist:
-        score_vsa += 15
-    elif (last['Close'] > prev['Close']) and (last['Volume'] < prev['Volume']):
-        score_vsa += 10
-        
+    if vol_dist: score_vsa += 15
     avg_vol20 = float(df['Volume'].iloc[-20:].mean()) if len(df) >= 20 else float(df['Volume'].mean())
     vol_weak = last['Volume'] < avg_vol20
-    prev_vol_weak = prev['Volume'] < (df['Volume'].iloc[-21:-1].mean() if len(df) >= 21 else avg_vol20)
-    
-    if vol_weak and prev_vol_weak:
-        score_vsa += 5
-        
+    if vol_weak: score_vsa += 10
     score += min(25, score_vsa)
     
-    # 4. CONTEXT (Max 10)
-    score_context = 0
-    p_ma50 = float(df['MA50'].iloc[-2]) if len(df) >= 2 and 'MA50' in df.columns else inds["ma50"]
-    if inds["ma50"] < p_ma50: # Ngược xu hướng lớn (MA50 dốc xuống)
-        score_context += 10
-        
-    near_res = (p >= exits["r1"] * 0.98) or (inds["cloud_top"] * 0.98 <= p <= inds["cloud_top"])
-    if near_res:
-        score_context += 5
-        
-    near_sup = (inds["k65"] * 1.02 >= p >= inds["k65"]) or (swing_low * 1.02 >= p >= swing_low)
-    if near_sup:
-        score_context -= 5
-        
-    score += min(10, max(-10, score_context))
-    
-    # 8. KILL SWITCH
-    if p < inds["k65"] and vol_dist:
-        score = max(score, 90)
-    
-    # Chuẩn hoá tổng điểm 0-100
+    # ---- TRAP & BOUNCE DETECTION ----
+    bull_trap = (inds["rsi"] > 70) and (last['Volume'] < avg_vol20 or inds["macd_hist"] < prev_macd_hist)
+    bottom_bounce = (inds["rsi"] < 30) and (last['Volume'] < 0.8 * avg_vol20) and (inds["macd_hist"] > prev_macd_hist)
+
     score = int(max(0, min(100, score)))
-    
-    # Tách bóc R/R riêng biệt (Không cộng vào risk score)
     risk_amt = max(0.01, p - exits["cutloss_partial"])
     reward_amt = max(0.01, exits["tp1"] - p)
-    
-    risk_pct = round((risk_amt / p) * 100, 2)
-    reward_pct = round((reward_amt / p) * 100, 2)
     rr = reward_amt / risk_amt
     
-    # Phân loại rủi ro chuẩn Trade
-    if score <= 25: desc = "LOW"
-    elif score <= 50: desc = "MEDIUM"
-    elif score <= 75: desc = "HIGH"
-    else: desc = "EXTREME"
-    
-    in_kumo = cloud_bottom <= p <= inds["cloud_top"]
+    desc = "LOW"
+    if score > 75 or bull_trap: desc = "EXTREME"
+    elif score > 50: desc = "HIGH"
+    elif score > 25: desc = "MEDIUM"
     
     return {
-        "score": score, 
-        "desc": desc, 
-        "rr": round(rr, 2),
-        "risk_pct": risk_pct,
-        "reward_pct": reward_pct,
-        "vol_dist": vol_dist,
-        "vol_weak": vol_weak,
-        "in_kumo": in_kumo
+        "score": score, "desc": desc, "rr": round(rr, 2),
+        "risk_pct": round((risk_amt / p) * 100, 2),
+        "reward_pct": round((reward_amt / p) * 100, 2),
+        "vol_dist": vol_dist, "vol_weak": vol_weak,
+        "bull_trap": bull_trap, "bottom_bounce": bottom_bounce
     }
 
 def evaluate_stock_valuation(ticker: str, df: pd.DataFrame, entry_info: dict) -> dict:
-    if len(df) < 2:
-        return {"is_valid": False, "reason": "Dữ liệu quá ngắn"}
-
-    # Step 1: Get Basic Indicators
+    if len(df) < 2: return {"is_valid": False, "reason": "Dữ liệu quá ngắn"}
+    
     inds = _get_indicators(df)
     price = inds["price"]
+    entry_type = entry_info.get("entry_type", "NONE")
     
-    # Step 2: Get Signal History & Price Position
     levels = _get_entry_levels(df)
     pos = _classify_position(price, levels)
+    state = _determine_state(price, inds, entry_type)
     
-    # Step 3: Determine State
-    state = _determine_state(price, inds)
-    
-    # Step 4 & 5: Calculate Exits and S/R
     exits = _calculate_exits_and_sr(df, inds, entry_info)
-    
-    # Step 6: Risk Scoring
     risk = _calculate_risk_score(df, inds, exits)
+    health = _evaluate_technical_health(df, inds)
     
-    # Conclusion
-    entry_today = entry_info.get("entry_type") != "NONE"
+    # Conclusion logic: Combine State + Health + MAs
+    ma_ok = price > inds["ma20"]
+    cloud_ok = price > inds["cloud_top"]
     
+    entry_today = entry_type != "NONE"
     action = "WAIT"
-    p_kj = price >= inds["kijun"]
     
-    # 7. ACTION ENGINE
-    r_score = risk["score"]
-    
-    if r_score > 75 or price < inds["k65"] or risk["vol_dist"]:
+    if risk["score"] > 75 or risk["vol_dist"]:
         action = "NO TRADE"
-    elif r_score <= 50:
-        if risk["vol_weak"] or risk["in_kumo"]:
-            action = "WAIT (Vol yếu / Giá trong mây)"
-        elif entry_today and p_kj and risk["rr"] >= 1.2:
-            action = "YES"
-        elif not entry_today and state in ["STRONG_UPTREND", "UPTREND"] and p_kj and risk["rr"] >= 1.2:
-            action = "YES (Breakout / Tiếp diễn)"
-        else:
-            action = "WAIT (Chưa Setup / RR Thấp / Dưới Kijun)"
-    elif r_score <= 75:
-        if entry_today and risk["rr"] >= 1.5:
-            action = "YES (Setup nén / Tỷ trọng nhỏ)"
-        else:
-            action = "WAIT (Rủi ro cao)"
-            
+    elif health["health_score"] >= 3 and ma_ok and cloud_ok:
+        action = "YES (Ưu tiên tham gia)"
+    elif (entry_today or health["health_score"] >= 2) and risk["rr"] >= 1.2:
+        action = "YES (Có thể cân nhắc)"
+    else:
+        action = "WAIT (Chờ xác nhận)"
+        
     fomo = price > inds["ma20"] * 1.12
 
     return {
-        "is_valid": True,
-        "ticker": ticker,
-        "state": state,
-        "position": pos,
-        "price": price,
-        "s1": exits["s1"],
-        "s2": exits["s2"],
-        "r1": exits["r1"],
-        "r2": exits["r2"],
-        "break_buy": exits["break_buy"],
-        "cutloss_partial": exits["cutloss_partial"],
-        "cutloss_full": exits["cutloss_full"],
-        "tp1": exits["tp1"],
-        "tp2": exits["tp2"],
-        "trailing_stop": exits["trailing_stop"],
-        "risk_score": risk["score"],
-        "risk_desc": risk["desc"],
-        "rr_ratio": risk["rr"],
-        "risk_pct": risk["risk_pct"],
-        "reward_pct": risk["reward_pct"],
-        "action": action,
-        "fomo_warning": fomo,
-        "details": {
-            "ma20": inds["ma20"],
-            "ma50": inds["ma50"],
-            "tenkan": inds["tenkan"],
-            "kijun": inds["kijun"],
-            "k65": inds["k65"],
-            "cloud_top": inds["cloud_top"],
-            "levels": levels
-        }
+        "is_valid": True, "ticker": ticker, "state": state, "position": pos,
+        "price": price, "s1": exits["s1"], "s2": exits["s2"],
+        "r1": exits["r1"], "r2": exits["r2"], "break_buy": exits["break_buy"],
+        "cutloss_partial": exits["cutloss_partial"], "cutloss_full": exits["cutloss_full"],
+        "tp1": exits["tp1"], "tp2": exits["tp2"], "trailing_stop": exits["trailing_stop"],
+        "risk_score": risk["score"], "risk_desc": risk["desc"],
+        "rr_ratio": risk["rr"], "risk_pct": risk["risk_pct"],
+        "reward_pct": risk["reward_pct"], "action": action, "fomo_warning": fomo or risk["bull_trap"],
+        "bottom_bounce": risk["bottom_bounce"],
+        "tech_health": health,
+        "details": {"ma20": inds["ma20"], "ma50": inds["ma50"], "tenkan": inds["tenkan"],
+                    "kijun": inds["kijun"], "k65": inds["k65"], "cloud_top": inds["cloud_top"],
+                    "rsi": inds["rsi"], "levels": levels}
     }
