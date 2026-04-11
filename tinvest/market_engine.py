@@ -120,6 +120,8 @@ def analyze_market_index(df_index: pd.DataFrame, breadth_pct_ma20: float = 50.0,
 
     ftd_low = float('inf')  # Giá thấp nhất của phiên FTD
 
+    ftd_date = "N/A"
+
     dist_days = []
 
 
@@ -240,6 +242,8 @@ def analyze_market_index(df_index: pd.DataFrame, breadth_pct_ma20: float = 50.0,
 
                 ftd_quality = None
 
+                ftd_date = "N/A"
+
                 ra_day = 0
 
                 ra_low = float('inf')
@@ -251,6 +255,8 @@ def analyze_market_index(df_index: pd.DataFrame, breadth_pct_ma20: float = 50.0,
                 ftd_active = False
 
                 ftd_quality = None
+
+                ftd_date = "N/A"
 
                 ra_day = 0
 
@@ -289,6 +295,14 @@ def analyze_market_index(df_index: pd.DataFrame, breadth_pct_ma20: float = 50.0,
                 if ra_day >= 4 and pct_change > 0.012 and v > pv:
 
                     ftd_active = True
+
+                    try:
+
+                        ftd_date = str(df['Date'].iloc[i].date()) if hasattr(df['Date'].iloc[i], 'date') else str(df['Date'].iloc[i])
+
+                    except:
+
+                        ftd_date = str(df['Date'].iloc[i])
 
                     # Reset rolling_peak để tính toán 10% từ Đỉnh Mới kể từ khi có FTD
 
@@ -405,94 +419,82 @@ def analyze_market_index(df_index: pd.DataFrame, breadth_pct_ma20: float = 50.0,
 
 
     # ---- PHÂN LOẠI 8 TRẠNG THÁI (ƯU TIÊN TỪ TRÊN XUỐNG) ----
-
-    if ftd_active and c_last > ma50_last and ma20_last > ma50_last and dist_count <= 3 and rsi_last > 50 and macd_last > 0:
-
-        # 1. UPTREND – Thị trường tăng giá xác nhận
-
-        regime = "UPTREND"
-
-        action = "TRADE MẠNH – Tập trung mua Leader vượt đỉnh, có thể dùng Margin"
-
-
-
-    elif ftd_active and c_last > ma50_last and (dist_count >= 4 or ma20_last < ma50_last or rsi_last < 50):
-
-        # 2. UPTREND_UNDER_PRESSURE – Uptrend rủi ro
-
-        regime = "UPTREND_UNDER_PRESSURE"
-
-        action = "KHÔNG MUA ĐUỔI – Chốt lời từng phần, nâng chặn lãi, thu hẹp danh mục"
-
-
-
-    elif ftd_active and c_last < ma50_last and (c_last > ma20_last or c_last > kijun_last) and rsi_last > 45:
-
-        # 3. STABLE_RECOVERY – Hồi phục ổn định
-
-        regime = "STABLE_RECOVERY"
-
-        action = "TĂNG TỈ TRỌNG 50-75% – Tập trung Leader, có thể mua tích nền"
-
-
-
-    elif ftd_active and c_last > ma10_last:
-
-        # 4. RECOVERY – Hồi phục (có FTD & trên MA10)
-
-        regime = "RECOVERY"
-
-        action = "THĂM DÒ 10-20% – Mua cổ phiếu khỏe hơn thị trường, tín hiệu mạnh"
-
-
-
-    elif not ftd_active and ra_day >= 3:
-
-        # 5. WEAK_RECOVERY – Hồi phục yếu (có 3 phiên nỗ lực nhưng chưa FTD)
-
+    # Pre-calculate conditions for cleaner if-else
+    # 1. DOWNTREND: Giảm giá mạnh (>10%), chưa có RA
+    is_downtrend = (decline_from_peak >= 0.10) and (ra_day == 0) and not ftd_active
+    # 2. WEAK_RECOVERY: Đang Nỗ lực hồi phục nhưng chưa có FTD
+    is_weak_recovery = (decline_from_peak >= 0.10) and (ra_day > 0) and not ftd_active
+    # 3. RECOVERY: Vừa giảm mạnh >10%, đã có FTD nhưng có thể chưa vượt MA50
+    is_recovery = ftd_active and (rolling_peak - c_last)/rolling_peak < 0.10 and c_last <= ma50_last
+    # Mây
+    cloud_bottom = min(float(df['SpanA'].iloc[-1]), float(df['SpanB'].iloc[-1])) if 'SpanA' in df.columns else c_last
+    # 4. MARKET_WEAKENING: Suy yếu (nằm dưới ma50 hoặc k65), tenkan < k65, giá dưới mây
+    tenkan_last = float(df['Tenkan'].iloc[-1]) if 'Tenkan' in df.columns else c_last
+    kijun65_last = float(df['Kijun65'].iloc[-1]) if 'Kijun65' in df.columns else ma50_last
+    is_weakening = (c_last < ma50_last or c_last < kijun65_last) and (tenkan_last < kijun65_last) and (c_last < cloud_bottom)
+    
+    sideway_cond = abs(c_last - ma50_last) / (ma50_last + 1e-10) <= 0.05
+    
+    # Evaluate Regimes
+    if is_downtrend:
+        regime = "DOWNTREND"
+        action = "ĐỨNG NGOÀI – Chỉ Mua Sớm (Bắt Đáy) nếu có tín hiệu."
+        
+    elif is_weak_recovery:
         regime = "WEAK_RECOVERY"
-
-        action = "THEO DÕI CHẶT – Chờ đợi phiên FTD để xác nhận điểm mua"
-
-
-
-    elif abs(c_last - ma50_last) / (ma50_last + 1e-10) <= 0.05:
-
-        # 6. SIDEWAY – Đi ngang ±5% quanh MA50
-
-        regime = "SIDEWAY"
-
-        action = "SWING TRADE TẠI HỖ TRỢ – Tỷ trọng 20-30% tiền mặt"
-
-
-
-    elif c_last < ma50_last and not (decline_from_peak >= 0.10 and not ftd_active and ra_day < 3):
-
-        # 7. MARKET_WEAKENING – Suy yếu (dưới MA50)
-
+        action = "MUA SỚM – Hồi phục yếu, giới hạn tỷ trọng."
+        
+    elif is_weakening and not ftd_active:
         regime = "MARKET_WEAKENING"
+        action = "THU TIỀN – Thị trường suy yếu nguy hiểm."
 
-        action = "TIỀN MẶT TỐI THIỂU 50% – Không bắt đáy, chờ tín hiệu rõ ràng"
+    # --- Ưu tiên các trạng thái Hồi phục khi có FTD nhưng còn dưới MA50 ---
+    elif ftd_active:
+        # Check if it's early recovery (within 15 days of FTD)
+        is_early_recovery = False
+        if ftd_date != "N/A":
+            try:
+                # Find how many bars since ftd_date
+                ftd_dt = pd.to_datetime(ftd_date)
+                bars_since = (pd.to_datetime(df['Date']) >= ftd_dt).sum()
+                if bars_since <= 15:
+                    is_early_recovery = True
+            except: pass
 
+        if c_last <= ma50_last or is_early_recovery:
+            # If early recovery, don't jump to 'Under Pressure' even if dist count is higher
+            if c_last > ma20_last or c_last > kijun_last:
+                regime = "STABLE_RECOVERY"
+                action = "HỒI PHỤC ỔN ĐỊNH – Tăng tỷ trọng 50-75%."
+            elif c_last > ma10_last:
+                regime = "RECOVERY"
+                action = "HỒI PHỤC – Thăm dò 30-50%."
+            else:
+                regime = "WEAK_RECOVERY"
+                action = "FTD YẾU – Giá còn nằm quá sâu dưới các MA."
+        else:
+            # Price > MA50 and NOT early recovery
+            if dist_count >= 4 or (c_last < ma20_last and dist_count >= 2):
+                regime = "UPTREND_UNDER_PRESSURE"
+                action = "HẠ TỶ TRỌNG – Áp lực phân phối lớn."
+            elif c_last > ma20_last and dist_count < 3 and rsi_last > 45:
+                regime = "UPTREND"
+                action = "TRADE MẠNH – Tập trung vào cổ phiếu Leader."
+            elif decline_triggered_8:
+                regime = "WEAK_UPTREND"
+                action = "TĂNG TỶ TRỌNG – Vừa lấy lại MA50."
+            else:
+                regime = "UPTREND"
+                action = "TRADE MẠNH – Bám sát danh mục."
 
-
-    elif decline_from_peak >= 0.10 and ra_day < 3 and not ftd_active:
-
-        # 8. DOWNTREND – Giảm >10% từ đỉnh và chưa có nỗ lực hồi phục (RA<3)
-
-        regime = "DOWNTREND"
-
-        action = "ĐỨNG NGOÀI – Giữ tiền, chờ Nỗ lực hồi phục + FTD mới"
-
-
-
+    elif sideway_cond:
+        regime = "SIDEWAY"
+        action = "SWING TRADE – Giao dịch tại biên."
+        
     else:
-
-        # Fallback (Mặc định khi không thuộc các nhóm trên)
-
-        regime = "DOWNTREND"
-
-        action = "ĐỨNG NGOÀI – Giữ tiền, chờ tín hiệu"
+        # Fallback
+        regime = "SIDEWAY"
+        action = "THEO DÕI – Chờ thị trường rõ xu hướng."
 
 
 
@@ -509,6 +511,8 @@ def analyze_market_index(df_index: pd.DataFrame, breadth_pct_ma20: float = 50.0,
         "ftd_active": ftd_active,
 
         "ftd_quality": ftd_quality,
+
+        "ftd_date": ftd_date,
 
         "ra_day": ra_day,
 
@@ -832,7 +836,7 @@ def calculate_index_sr(df: pd.DataFrame) -> dict:
 
     # 1. Thu thập các Đỉnh (Peaks) và Đáy (Valleys) cục bộ trong 250 phiên
 
-    lookback = min(250, len(df) - 10)
+    lookback = min(90, len(df) - 10)
 
     peaks = []
 
@@ -870,9 +874,10 @@ def calculate_index_sr(df: pd.DataFrame) -> dict:
 
     # Loại bỏ trùng lặp và sắp xếp
 
-    peaks = sorted(list(set(peaks)))
+    # Keep chronological order
+    # peaks = sorted(list(set(peaks)))
 
-    valleys = sorted(list(set(valleys)))
+    # valleys = sorted(list(set(valleys)))
 
 
 
@@ -888,7 +893,7 @@ def calculate_index_sr(df: pd.DataFrame) -> dict:
 
     if peaks_below:
 
-        s_candidates.append(max(peaks_below))
+        s_candidates.append(peaks_below[-1])
 
         
 
@@ -896,20 +901,22 @@ def calculate_index_sr(df: pd.DataFrame) -> dict:
 
     # - Đáy cũ thứ 2 đã vượt qua thấp hơn (Valley < cp, lấy max thứ 2)
 
-    valleys_below = sorted([v for v in valleys if v < cp], reverse=True)
+    valleys_below = [v for v in valleys if v < cp]
 
     if len(valleys_below) >= 1:
 
-        s_candidates.append(valleys_below[0])
+        s_candidates.append(valleys_below[-1])
 
     if len(valleys_below) >= 2:
 
-        s_candidates.append(valleys_below[1])
+        s_candidates.append(valleys_below[-2])
 
         
 
     # - MA100, MA200 nếu giá hiện tại đang nằm trên chúng
 
+    if ma20 > 0 and cp > ma20: s_candidates.append(ma20)
+    if ma50 > 0 and cp > ma50: s_candidates.append(ma50)
     if ma100 > 0 and cp > ma100: s_candidates.append(ma100)
 
     if ma200 > 0 and cp > ma200: s_candidates.append(ma200)
@@ -938,7 +945,7 @@ def calculate_index_sr(df: pd.DataFrame) -> dict:
 
     if valleys_above:
 
-        r_candidates.append(min(valleys_above))
+        r_candidates.append(valleys_above[-1])
 
         
 
@@ -948,7 +955,7 @@ def calculate_index_sr(df: pd.DataFrame) -> dict:
 
     if peaks_above:
 
-        r_candidates.append(min(peaks_above))
+        r_candidates.append(peaks_above[-1])
 
         
 

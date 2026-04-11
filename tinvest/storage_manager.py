@@ -221,6 +221,53 @@ class StorageManager:
                 
         return counts
 
+    def save_active_registry(self, tickers: list):
+        """Save a list of currently active market tickers to a whitelist file."""
+        import json
+        path = self.base_dir / "active_tickers.json"
+        
+        # Luon bao gom cac index quan trong
+        core_indices = ["VNINDEX", "HNX-INDEX", "UPCOM-INDEX", "VN30", "HNX30"]
+        unique_tickers = sorted(list(set(tickers) | set(core_indices)))
+        
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(unique_tickers, f, ensure_ascii=False, indent=2)
+        logger.info(f"Saved {len(unique_tickers)} tickers to active registry.")
+
+    def get_active_registry(self):
+        """Load the whitelist of active tickers. Returns None if no registry exists."""
+        import json
+        path = self.base_dir / "active_tickers.json"
+        if path.exists():
+            with open(path, 'r', encoding='utf-8') as f:
+                return set(json.load(f))
+        return None
+
+    def cleanup_inactive_files(self, dry_run=True):
+        """
+        Delete .parquet files from prices/indicators/analysis that are not in the active registry.
+        Safety check: only delete if the file hasn't been modified in 7 days? 
+        Actually, if we have a registry, that's our SSoT.
+        """
+        registry = self.get_active_registry()
+        if not registry:
+            logger.warning("No active registry found. Cleanup aborted to prevent data loss.")
+            return []
+            
+        deleted = []
+        for folder in [self.prices_dir, self.indicators_dir, self.analysis_dir]:
+            ext = "*.parquet" if folder != self.analysis_dir else "*.json"
+            for p in folder.glob(ext):
+                ticker = p.stem.upper()
+                if ticker not in registry:
+                    deleted.append(str(p))
+                    if not dry_run:
+                        try:
+                            p.unlink()
+                        except Exception as e:
+                            logger.error(f"Failed to delete {p.name}: {e}")
+        return deleted
+
     def delete_specific_dates(self, dates_to_delete: list):
         """
         Remove rows for specific dates from ALL price and indicator parquet files.

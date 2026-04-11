@@ -11,6 +11,8 @@ Giao diện người dùng cho hệ thống phân tích AIC code = AI + cơm!
 
 
 import tkinter as tk
+import logging
+logger = logging.getLogger(__name__)
 
 
 from tkinter import filedialog, messagebox
@@ -136,30 +138,18 @@ def analyze_ticker_worker(ticker_df_tuple):
         # Lưu df_rich (đã enrich) thay vì df raw để tái sử dụng cho breadth, scanner
 
 
+        from tinvest.state_engine import evaluate_state_rules
+        state_rules = evaluate_state_rules(df_rich)
+        
         return ticker, {
-
-
             "df": df_rich,
-
-
             "ichi": ichi,
-
-
             "vsa": vsa,
-
-
             "adv": adv,
-
-
             "accum": accum,
-
-
             "ma_trend": ma_trend,
-
-
-            "val": val
-
-
+            "valuation": val,
+            "state_rules": state_rules
         }
 
 
@@ -173,21 +163,28 @@ def analyze_ticker_worker(ticker_df_tuple):
 
 
 def analyze_batch_worker(batch):
-
-
     """Xử lý một nhóm (batch) mã cổ phiếu trong một tiến trình duy nhất."""
-
-
     results = []
-
-
     for item in batch:
-
-
         results.append(analyze_ticker_worker(item))
-
-
     return results
+
+def load_cache_worker(args):
+    """
+    Worker for ThreadPoolExecutor to load data from disk.
+    Args: (ticker, storage_instance)
+    """
+    ticker, storage = args
+    try:
+        df = storage.load_ticker_data(ticker)
+        if df is not None:
+            analysis = storage.load_latest_analysis(ticker)
+            if analysis:
+                analysis['df'] = df
+            return ticker, df, analysis
+    except Exception:
+        pass
+    return ticker, None, None
 
 
 
@@ -317,9 +314,10 @@ class TinvestApp:
 
 
         btn_vs = tk.Button(frame_btns, text="🌐 Update", command=self.run_vietstock_update, bg="#2196F3", fg="white", font=("Arial", 9, "bold"), padx=8)
-
-
         btn_vs.pack(side=tk.RIGHT, padx=2)
+
+        btn_cleanup = tk.Button(frame_btns, text="🧹 Dọn dẹp", command=self.cleanup_storage, bg="#FF5722", fg="white", font=("Arial", 9, "bold"), padx=8)
+        btn_cleanup.pack(side=tk.RIGHT, padx=2)
 
 
 
@@ -523,7 +521,7 @@ class TinvestApp:
 
 
 
-        btn_wait = tk.Button(frame_signals_2, text="⏳ Cổ phiếu WAIT", command=lambda: self.run_advanced_scanner("WAIT"), bg="#D2691E", fg="white", font=("Arial", 10, "bold"))
+        btn_wait = tk.Button(frame_signals_2, text="☁️ Danh mục UPCLOUD", command=lambda: self.run_advanced_scanner("UPCLOUD"), bg="#1E90FF", fg="white", font=("Arial", 10, "bold"))
 
 
         btn_wait.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
@@ -1121,15 +1119,27 @@ class TinvestApp:
 
 
     def load_from_cache(self):
-
-
         """Trigger cache loading in background thread."""
-
-
         self.log_sync("\n--- ĐANG TẢI DỮ LIỆU TỪ BỘ NHỚ ĐỆM (CACHE)... ---", clear=True)
-
-
         threading.Thread(target=self._load_from_cache_bg, daemon=True).start()
+
+    def cleanup_storage(self):
+        """Physically delete junk files from disk based on the registry."""
+        registry = self.storage.get_active_registry()
+        if not registry:
+            messagebox.showwarning("Cảnh báo", "Chưa có Registry (Whitelist). Vui lòng Chạy 'Update' trước để hệ thống xác định danh sách mã niêm yết hiện tại.")
+            return
+            
+        junk_tickers = self.storage.cleanup_inactive_files(dry_run=True)
+        if not junk_tickers:
+            messagebox.showinfo("Thông báo", "Tuyệt vời! Dữ liệu của bạn đã sạch sẽ, không tìm thấy mã rác nào.")
+            return
+            
+        confirm = messagebox.askyesno("Xác nhận dọn dẹp", f"Tìm thấy {len(junk_tickers)} mã cũ/rác (không còn niêm yết hoặc file rác).\n\nBạn có chắc chắn muốn XÓA VĨNH VIỄN các file này khỏi ổ cứng để tăng tốc hệ thống không?")
+        if confirm:
+            deleted = self.storage.cleanup_inactive_files(dry_run=False)
+            messagebox.showinfo("Hoàn tất", f"Đã xóa thành công {len(deleted)} mã rác. Hãy 'Load Cache' lại để thấy sự thay đổi.")
+            self.load_from_cache()
 
 
 
@@ -1165,78 +1175,47 @@ class TinvestApp:
             
 
 
+            registry = self.storage.get_active_registry()
+            all_storage_tickers = tickers # Original list on disk
+            if registry:
+                filtered = [t for t in tickers if t in registry]
+                self.log_sync(f"[*] Registry tìm thấy {len(registry)} mã. Lọc bỏ {len(tickers)-len(filtered)} mã cũ/rác.")
+                tickers = filtered
+            
             total = len(tickers)
-
-
-            cnt = 0
-
-
+            self.log_sync(f"[*] Đang nạp {total} mã cổ phiếu bằng đa luồng (8-16 workers)...")
             
-
-
-            for t in tickers:
-
-
-                # Load price
-
-
-                df = self.storage.load_ticker_data(t)
-
-
-                if df is not None:
-
-
-                    self.data_dict[t] = df
-
-
-                    
-
-
-                    # Load analysis
-
-
-                    analysis = self.storage.load_latest_analysis(t)
-
-
-                    if analysis:
-
-
-                        analysis['df'] = df
-
-
-                        self.analysis_cache[t] = analysis
-
-
+            # --- PARALLEL LOADING ---
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            num_workers = min(16, (os.cpu_count() or 4) * 2)
+            
+            loaded_count = 0
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                tasks = [(t, self.storage) for t in tickers]
+                futures = {executor.submit(load_cache_worker, tea): tea[0] for tea in tasks}
                 
+                for future in as_completed(futures):
+                    t, df, analysis = future.result()
+                    if df is not None:
+                        self.data_dict[t] = df
+                        if analysis:
+                            self.analysis_cache[t] = analysis
+                    
+                    loaded_count += 1
+                    if loaded_count % 100 == 0 or loaded_count == total:
+                        self.log_sync(f" ---> Tiến trình: Đã nạp {loaded_count}/{total} mã cổ phiếu...")
 
-
-                cnt += 1
-
-
-                if cnt % 50 == 0 or cnt == total:
-
-
-                    self.log_sync(f" ---> Tiến trình: Đã nạp {cnt}/{total} mã cổ phiếu...")
-
-
-
-
-
+            # --- FINISH ---
             self._update_breadth_from_cache()
-
-
-            self.root.after(0, self.lbl_file.config, {"text": f"Dữ liệu CACHE: {len(self.analysis_cache)} mã", "fg": "blue"})
-
-
-            self.log_sync(f"✅ Hoàn tất! Đã nạp thành công {len(self.analysis_cache)} mã từ bộ nhớ đệm.")
-
-
+            self.root.after(0, self.lbl_file.config, {"text": f"Dữ liệu: {len(self.analysis_cache)} mã", "fg": "blue"})
+            self.log_sync(f"✅ Hoàn tất! Đã nạp thành công {len(self.analysis_cache)} mã.")
             
-
+            # Check for physical cleanup
+            if registry and len(all_storage_tickers) > len(tickers) + 50:
+                self.log_sync(f"\n⚠️ LƯU Ý: Phát hiện {len(all_storage_tickers) - len(tickers)} mã 'rác' trong ổ cứng.")
+                self.log_sync("Hệ thống đã tự động lọc bỏ khi nạp. Bạn có thể nhấn 'Xóa mã cũ' để dọn dẹp ổ cứng.")
 
         except Exception as e:
-
-
             self.log_sync(f"⚠️ Lỗi khi nạp cache: {e}")
 
 
@@ -1472,9 +1451,13 @@ class TinvestApp:
 
 
                     total_p1 = len(day_total)
-
-
                     self.log_sync(f"   [DONE] Ngày {d}: Tổng cộng {total_p1} mã.")
+                    
+                    # Cap nhat Registry neu day la ngay moi nhat va du lieu "sach" (>1000 ma)
+                    if total_p1 > 1000 and d == missing_dates[-1]:
+                        all_tickers = df_day['Ticker'].unique().tolist()
+                        self.storage.save_active_registry(all_tickers)
+                        self.log_sync(f"   [*] Đã cập nhật Registry: {len(all_tickers)} mã niêm yết.")
 
 
                     
@@ -1958,15 +1941,9 @@ class TinvestApp:
 
 
             from tinvest.analyzer import analyze_stock, format_report
-
-
             result = analyze_stock(ticker, df)
-
-
             report = format_report(result)
-
-
-            self.log_sync(report, clear=True)
+            self.log_sync(f"BÁO CÁO CHI TIẾT MÃ: {ticker}\n" + report, clear=True)
 
 
         except Exception as e:
@@ -2011,19 +1988,21 @@ class TinvestApp:
             for ticker, data in self.analysis_cache.items():
 
 
-                res = data["adv"]
+                # Flexible key mapping for signal and accumulation
+                res = data.get("adv") or data.get("advanced_entry") or data.get("entry_signal") or {}
+                accum = data.get("accum") or data.get("accumulation") or {}
 
 
-                accum = data["accum"]
-
-
-                val = data.get("val", {})
+                # Ensure backward compatibility for valuation key
+                val = data.get("valuation") or data.get("val") or {}
 
 
                 
 
 
-                df = data["df"]
+                df = data.get("df")
+                if df is None or (hasattr(df, 'empty') and df.empty):
+                    continue
 
 
                 avg_vol_20 = df["Volume"].tail(20).mean() if len(df) >= 20 else df["Volume"].mean()
@@ -2056,7 +2035,7 @@ class TinvestApp:
                 elif entry_target == "PERFECT_MA":
 
 
-                    ma_trend = data.get("ma_trend", {})
+                    ma_trend = data.get("ma_trend") or data.get("ma") or {}
 
 
                     if ma_trend.get("is_perfect_uptrend"):
@@ -2075,48 +2054,71 @@ class TinvestApp:
 
 
                 elif entry_target == "TRADEABLE":
-
-
                     action_str = val.get("action", "")
-
-
-                    if action_str.startswith("YES"):
-
-
+                    sr = data.get("state_rules", {})
+                    sr_sig = sr.get("signal", "NONE")
+                    sr_pri = sr.get("primary", "")
+                    sr_avoid = sr.get("avoid_entry", False)
+                    sr_conf = int(sr.get("confidence", 0))
+                    
+                    opp_score = val.get("opp_score", 0)
+                    risk_score = val.get("risk_score", 0)
+                    
+                    # Dieu kien mua NGHIEM NGAT hon de loc co phieu "Mua duoc luon":
+                    # 1) Opportunity Score cao (>= 50) va Risk Score thap (< 45)
+                    # 2) Primary State phai la TANG hoac bat dau TANG/Nen chat
+                    # 3) Khong bi bo loc rui ro chan
+                    # 4) Gia khong vuot qua 5% so voi diem mua ly tuong (Buy Zone)
+                    
+                    ideal_price = val.get("price", 0)
+                    current_price = df['Close'].iloc[-1]
+                    in_buy_zone = (current_price <= ideal_price * 1.05) if ideal_price > 0 else False
+                    
+                    trend_ok = sr_pri in ["UPTREND", "UPTREND_START", "WEAK_UPTREND", "TRANSITION", "SQUEEZE"]
+                    
+                    # Bo loc tong hop ni l?ng theo yu c?u
+                    if not sr_avoid and trend_ok and sr_conf >= 1 and opp_score >= 50 and risk_score < 45 and in_buy_zone:
                         match = True
-
-
                         size = res.get("position_size", "N/A")
+                        conf = f"STATE:{sr_conf} | OPP:{opp_score}"
+                        flags = f"Buy Zone ({(current_price/ideal_price-1)*100:+.1f}%) | {sr_sig} | {sr_pri}"
 
 
-                        conf = res.get("confidence", "N/A")
-
-
-                        flags = action_str
-
-
-                elif entry_target == "WAIT":
-
-
-                    action_str = val.get("action", "")
-
-
-                    if action_str.startswith("WAIT"):
-
-
+                elif entry_target == "UPCLOUD":
+                    # Criteria:
+                    # 1. Price > Cloud top (SpanA, SpanB)
+                    # 2. Future Cloud is Green (SpanA_ahead > SpanB_ahead)
+                    # 3. Tenkan > Kijun
+                    # 4. MA10 > MA20
+                    
+                    last = df.iloc[-1]
+                    current_price = last['Close']
+                    span_a = last.get('SpanA', 0)
+                    span_b = last.get('SpanB', 0)
+                    tenkan = last.get('Tenkan', 0)
+                    kijun = last.get('Kijun', 0)
+                    ma10 = last.get('MA10', 0)
+                    ma20 = last.get('MA20', 0)
+                    
+                    # Future Cloud calculation (plotted 26 days ahead based on today's data)
+                    future_span_a = (tenkan + kijun) / 2
+                    h52 = df['High'].iloc[-52:].max()
+                    l52 = df['Low'].iloc[-52:].min()
+                    future_span_b = (h52 + l52) / 2
+                    
+                    c1 = (current_price > span_a) and (current_price > span_b) if span_a > 0 else False
+                    c2 = (future_span_a > future_span_b)
+                    c3 = (tenkan > kijun)
+                    c4 = (ma10 > ma20)
+                    
+                    if c1 and c2 and c3 and c4:
                         match = True
-
-
-                        size = res.get("position_size", "N/A")
-
-
-                        conf = res.get("confidence", "N/A")
-
-
-                        flags = action_str
+                        size = "N/A"
+                        conf = "ICHIMOKU"
+                        flags = "UPCLOUD (Price > Cloud | Mây TL Xanh | T>K | MA10>MA20)"
                 elif entry_target == "WHITE_ADX":
-                    from tinvest.advanced_entry import _get_adx_status
-                    if _get_adx_status(df, -1) == "WHITE":
+                    adx_color = str(df['ADX_Color'].iloc[-1]).upper() if 'ADX_Color' in df.columns else "N/A"
+                    if adx_color == "WHITE":
                         match = True
                         size = "N/A"
                         conf = "STRONG"
@@ -2148,9 +2150,13 @@ class TinvestApp:
                 if match:
 
 
-                    # Skip if risk is too high or invalid data
+                    # Skip if risk is too high or explicitly invalid data
                     risk_limit = 20.0 if entry_target == "WHITE_ADX" else 15.0
-                    if not val.get("is_valid") or val.get("risk_pct", 0) > risk_limit:
+                    # For compatibility, if 'is_valid' is missing (None), we treat it as True
+                    # Skip if risk is too high or explicitly invalid data
+                    risk_limit = 20.0 if entry_target == "WHITE_ADX" else 15.0
+                    # For compatibility, if 'is_valid' is missing (None), we treat it as True
+                    if val.get("is_valid", True) is False or val.get("risk_pct", 0) > risk_limit:
                         continue 
 
 
@@ -2182,7 +2188,7 @@ class TinvestApp:
                     rr_ratio = val.get("rr_ratio", 0)
 
 
-                    val_score = data.get("val", {}).get("risk_score", 0) if data.get("val") else 0
+                    val_score = val.get("risk_score", 0)
 
 
                     current_p = float(df['Close'].iloc[-1]) * 1000
@@ -2336,10 +2342,10 @@ class TinvestApp:
                 
 
 
-                # Take last 150 days for visibility
+                # Take last 100 days for clearer visibility
 
 
-                df_plot = df_rich.tail(150).copy()
+                df_plot = df_rich.tail(100).copy()
 
 
                 df_plot['Date'] = pd.to_datetime(df_plot['Date'])
@@ -2378,7 +2384,7 @@ class TinvestApp:
                 
 
 
-                hist_cloud = df_rich[['Date', 'SpanA', 'SpanB']].tail(150).copy()
+                hist_cloud = df_rich[['Date', 'SpanA', 'SpanB']].tail(100).copy()
 
 
                 
@@ -2426,252 +2432,211 @@ class TinvestApp:
 
 
 
-                # Fetch analysis...
-
-
-                analysis = self.analysis_cache.get(ticker, {})
-
-
-                val = analysis.get('val', {})
-
-
-                adv = analysis.get('adv', {})
+                # Fetch analysis (RE-CALCULATE to ensure chart is in sync with latest logic)
+                from tinvest.analyzer import analyze_stock
+                analysis_fresh = analyze_stock(ticker, df_rich)
+                val = analysis_fresh.get('valuation', {})
+                adv = analysis_fresh.get('adv', {})
+                analysis = analysis_fresh # Use fresh for the rest of drawing too
 
 
                 
 
 
-                # Create fig (Thinner height for standard screen)
+                # Create fig (4 subplots for Price, Volume, RSI, ADX)
 
 
-                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), gridspec_kw={'height_ratios': [4, 1.2]}, sharex=True)
+                fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(15, 12), gridspec_kw={'height_ratios': [5, 1.2, 1.2, 1.5]}, sharex=True)
 
 
-                plt.subplots_adjust(hspace=0.03, bottom=0.15)
+                plt.subplots_adjust(hspace=0.08, bottom=0.1)
 
 
                 
 
 
+                # --- MAP X AXIS TO ORDINAL SCALAR TO PREVENT GAPS ---
+                x_idx_plot = np.arange(len(df_plot))
+                x_idx_ext = np.arange(len(df_ext))
+                
+                date_labels = df_ext['Date'].dt.strftime('%d/%m').tolist()
+                def format_date(x, pos):
+                    try:
+                        idx = int(round(x))
+                        if 0 <= idx < len(date_labels):
+                            return date_labels[idx]
+                    except:
+                        pass
+                    return ""
+                
                 # Plot Candlesticks...
-
-
-                ax1.bar(mdates.date2num(up['Date']), up['Close'] - up['Open'], bottom=up['Open'], color='green', width=0.6, alpha=0.8)
-
-
-                ax1.bar(mdates.date2num(down['Date']), down['Open'] - down['Close'], bottom=down['Close'], color='red', width=0.6, alpha=0.8)
-
-
-                ax1.vlines(mdates.date2num(up['Date']), up['Low'], up['High'], color='green', linewidth=1)
-
-
-                ax1.vlines(mdates.date2num(down['Date']), down['Low'], down['High'], color='red', linewidth=1)
-
-
-                
-
+                up_mask = df_plot['Close'] >= df_plot['Open']
+                down_mask = df_plot['Close'] < df_plot['Open']
+                ax1.bar(x_idx_plot[up_mask], df_plot.loc[up_mask, 'Close'] - df_plot.loc[up_mask, 'Open'], bottom=df_plot.loc[up_mask, 'Open'], color='green', width=0.6, alpha=0.8)
+                ax1.bar(x_idx_plot[down_mask], df_plot.loc[down_mask, 'Open'] - df_plot.loc[down_mask, 'Close'], bottom=df_plot.loc[down_mask, 'Close'], color='red', width=0.6, alpha=0.8)
+                ax1.vlines(x_idx_plot[up_mask], df_plot.loc[up_mask, 'Low'], df_plot.loc[up_mask, 'High'], color='green', linewidth=1)
+                ax1.vlines(x_idx_plot[down_mask], df_plot.loc[down_mask, 'Low'], df_plot.loc[down_mask, 'High'], color='red', linewidth=1)
 
                 # Plot MAs...
-
-
                 ma_styles = [('MA10', 'black', 'MA10', 2), ('MA20', 'green', 'MA20', 2), ('MA50', 'brown', 'MA50', 1)]
-
-
                 for ma_col, color, label, lw in ma_styles:
-
-
                     if ma_col in df_plot.columns:
-
-
-                        ax1.plot(df_plot['Date'], df_plot[ma_col], label=label, color=color, linewidth=lw, alpha=0.8)
-
-
-                
-
+                        ax1.plot(x_idx_plot, df_plot[ma_col], label=label, color=color, linewidth=lw, alpha=0.8)
 
                 # Plot Ichimoku Cloud
-
-
-                ax1.fill_between(df_total_cloud['Date'], df_total_cloud['SpanA'], df_total_cloud['SpanB'], 
-
-
+                ax1.fill_between(x_idx_ext, df_total_cloud['SpanA'], df_total_cloud['SpanB'], 
                                  where=(df_total_cloud['SpanA'] >= df_total_cloud['SpanB']), color='lime', alpha=0.3, label='Kumo Green')
-
-
-                ax1.fill_between(df_total_cloud['Date'], df_total_cloud['SpanA'], df_total_cloud['SpanB'], 
-
-
+                ax1.fill_between(x_idx_ext, df_total_cloud['SpanA'], df_total_cloud['SpanB'], 
                                  where=(df_total_cloud['SpanA'] < df_total_cloud['SpanB']), color='red', alpha=0.3, label='Kumo Red')
-
-
                     
-
-
                 if 'Tenkan' in df_plot.columns:
-
-
-                    ax1.plot(df_plot['Date'], df_plot['Tenkan'], color='blue', label='Tenkan', linewidth=1.0, alpha=0.9)
-
-
+                    ax1.plot(x_idx_plot, df_plot['Tenkan'], color='blue', label='Tenkan', linewidth=1.0, alpha=0.9)
                 if 'Kijun' in df_plot.columns:
-
-
-                    ax1.plot(df_plot['Date'], df_plot['Kijun'], color='red', label='Kijun', linewidth=1.0, alpha=0.9)
-
-
+                    ax1.plot(x_idx_plot, df_plot['Kijun'], color='red', label='Kijun', linewidth=1.0, alpha=0.9)
                 if 'Kijun65' in df_plot.columns:
-
-
-                    ax1.plot(df_plot['Date'], df_plot['Kijun65'], color='orange', linestyle='--', label='Dao 65', linewidth=2.0, alpha=0.8)
-
-
-
-
+                    ax1.plot(x_idx_plot, df_plot['Kijun65'], color='orange', linestyle='--', label='Dao 65', linewidth=2.0, alpha=0.8)
 
                 # Scaling: Limit Y axis to price area
-
-
                 p_min, p_max = df_plot['Low'].min(), df_plot['High'].max()
-
-
                 ax1.set_ylim(p_min * 0.95, p_max * 1.05)
-
-
                 
-
-
                 # Plot S1, S2, R1, R2 lines...
+                last_idx = x_idx_plot[-1]
+                future_idx = last_idx + 22
+                
+                # Formatting helper and Title
+                is_index = ticker.upper().endswith("INDEX") or "VN30" in ticker.upper()
+                fmt = "{:,.0f}" if is_index else "{:,.2f}"
+                
+                # --- Top Title with Logo ---
+                logo_path = r"C:\Users\COMPUTER\Desktop\Vector logo.png"
+                logo_found = False
+                try:
+                    if os.path.exists(logo_path):
+                        from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+                        import matplotlib.image as mpimg
+                        img = mpimg.imread(logo_path)
+                        imagebox = OffsetImage(img, zoom=0.15) # Adjust zoom as needed
+                        ab = AnnotationBbox(imagebox, (0.4, 0.96), frameon=False, xycoords='figure fraction')
+                        fig.add_artist(ab)
+                        fig.text(0.45, 0.96, "=AI+CƠM!", ha="left", va="center", fontsize=22, fontweight='bold', color='black')
+                        logo_found = True
+                except Exception as e:
+                    logger.error(f"Error loading logo: {e}")
+                
+                if not logo_found:
+                    fig.text(0.5, 0.98, "AIC CODE = AI + CƠM!", ha="center", va="top", fontsize=20, fontweight='bold', color='black')
+                
+                ax1.set_title(f"Technical Analysis Report:", fontsize=12, style='italic', color='#555555', pad=10, loc='center')
+                ax1.text(0.5, 1.12, ticker, transform=ax1.transAxes, fontsize=24, fontweight='bold', color='darkblue', ha='center', va='bottom')
 
-
+                # Current Price Marker
+                current_price = df_plot['Close'].iloc[-1]
+                ax1.hlines(current_price, xmin=last_idx, xmax=future_idx, color='black', linestyle='-', linewidth=2.0, alpha=0.8)
+                ax1.text(future_idx, current_price, f" {fmt.format(current_price)}", color='black', fontsize=10, fontweight='bold', va='center', ha='left', bbox=dict(facecolor='yellow', alpha=0.8, edgecolor='none', pad=1))
+                
                 if val:
-
-
                     sr_config = [('s1', 'green', 'S1'), ('s2', 'darkgreen', 'S2'), 
-
-
                                  ('r1', 'red', 'R1'), ('r2', 'darkred', 'R2')]
-
-
                     for sr_key, color, lbl in sr_config:
-
-
                         level = val.get(sr_key, 0)
-
-
                         if level > 0:
+                            ax1.hlines(level, xmin=last_idx, xmax=future_idx, color=color, linestyle='--', alpha=0.8, linewidth=1.5)
+                            ax1.text(future_idx, level, f" {lbl}: {fmt.format(level)}", color=color, 
+                                     fontsize=9, fontweight='bold', va='center', ha='left')
 
-
-                            ax1.axhline(level, color=color, linestyle='--', alpha=0.8, linewidth=1.5)
-
-
-                            ax1.text(df_ext['Date'].iloc[0], level, f" {lbl}: {level:,.0f}", color=color, 
-
-
-                                     fontsize=9, fontweight='bold', va='bottom', alpha=1.0)
+                # --- Summary Assessment Overlay ---
+                sr = analysis.get('state_rules', {})
+                sr_pri = sr.get('primary', 'N/A')
+                sr_sec = sr.get('secondary', 'N/A')
+                opp_score = val.get('opp_score', 0)
+                risk_score = val.get('risk_score', 0)
+                report_date = df_plot['Date'].iloc[-1].strftime('%d/%m/%Y')
+                
+                summary_text = (
+                    f"TÓM LƯỢC NHẬN ĐỊNH ({report_date})\n"
+                    f"● Trạng thái: {sr_pri}\n"
+                    f"● Vận động: {sr_sec}\n"
+                    f"● Opp Score: {opp_score}/100 | Risk: {risk_score}/100\n"
+                    f"● Xu hướng: {'TĂNG' if opp_score > 50 else 'THEO DÕI' if opp_score > 30 else 'YẾU'}"
+                )
+                
+                # Move summary box down to avoid Legend overlap
+                ax1.text(0.01, 0.75, summary_text, transform=ax1.transAxes, fontsize=10,
+                         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='darkblue'))
 
 
                 
 
 
                 # Signals... (up to 3 arrows)
-
-
                 from tinvest.advanced_entry import _eval_day
-
-
                 buy_signals = []
-
-
-                for idx in df_plot.index.tolist():
-
-
-                    rel_idx = -(len(df_rich) - df_rich.index.get_loc(idx))
-
-
+                for real_idx in df_plot.index.tolist():
+                    rel_idx = -(len(df_rich) - df_rich.index.get_loc(real_idx))
                     sig = _eval_day(df_rich, rel_idx)
-
-
                     if sig and sig.get('type') in ["EARLY", "ADD_1", "ADD_2", "STRONG"]:
-
-
-                        buy_signals.append({'date': df_rich['Date'].loc[idx], 'type': sig['type'], 
-
-
-                                           'source': sig.get('details', {}).get('source', 'N/A'), 'price': df_rich['Low'].loc[idx]})
-
-
-                
-
+                        buy_signals.append({'date': df_rich['Date'].loc[real_idx], 'type': sig['type'], 
+                                           'source': sig.get('details', {}).get('source', 'N/A'), 'price': df_rich['Low'].loc[real_idx]})
 
                 buy_signals = sorted(buy_signals, key=lambda x: x['date'], reverse=True)[:3]
-
-
-                annotation_text = "3 ĐIỂM MUA GẦN NHẤT:\n"
-
-
+                annotation_text = "3 ĐIỂM MUA GẦN NHẤT:\n\n"
                 for i, b in enumerate(buy_signals):
-
-
-                    ax1.plot(b['date'], b['price'] * 0.98, '^', markersize=12, color='lime', markeredgecolor='green')
-
-
-                    annotation_text += f" • #{i+1}: {b['date'].strftime('%d/%m')} - {b['type']} ({b['source']})\n"
-
-
-                
-
+                    matches = np.where(df_plot['Date'] == b['date'])[0]
+                    if len(matches) > 0:
+                        pos = matches[0]
+                        ax1.plot(pos, b['price'] * 0.98, '^', markersize=12, color='lime', markeredgecolor='green')
+                        annotation_text += f" • #{i+1}: {b['date'].strftime('%d/%m')} - {b['type']} ({b['source']})\n\n"
 
                 if buy_signals:
-
-
                     fig.text(0.1, 0.02, annotation_text, fontsize=10, color='darkgreen', 
-
-
-                             bbox=dict(facecolor='white', alpha=0.8, edgecolor='lime'))
-
-
-
-
+                             linespacing=1.8, bbox=dict(facecolor='white', alpha=0.9, edgecolor='lime', pad=5))
 
                 # Volume...
-
-
-                ax2.bar(mdates.date2num(df_plot['Date']), df_plot['Volume'], 
-
-
+                ax2.bar(x_idx_plot, df_plot['Volume'], 
                         color=np.where(df_plot['Close'] >= df_plot['Open'], 'green', 'red'), alpha=0.5, width=0.6)
-
-
                 if 'VolMA20' in df_plot.columns:
+                    ax2.plot(x_idx_plot, df_plot['VolMA20'], color='blue', alpha=0.6)
 
+                # --- RSI Subplot ---
+                if 'RSI' in df_plot.columns:
+                    ax3.plot(x_idx_plot, df_plot['RSI'], color='purple', linewidth=1.5, label='RSI (14)')
+                    ax3.axhline(70, color='red', linestyle='--', alpha=0.5)
+                    ax3.axhline(50, color='gray', linestyle='-.', alpha=0.5)
+                    ax3.axhline(30, color='green', linestyle='--', alpha=0.5)
+                    ax3.set_ylabel('RSI', fontweight='bold', fontsize=9)
+                    ax3.set_ylim(10, 90)
+                    ax3.legend(loc='upper left', fontsize=8)
+                    ax3.grid(True, linestyle='--', alpha=0.3)
+                else:
+                    ax3.set_visible(False)
 
-                    ax2.plot(df_plot['Date'], df_plot['VolMA20'], color='blue', alpha=0.6)
-
-
-
-
+                # --- MACD Subplot ---
+                if 'MACD' in df_plot.columns and 'MACD_Signal' in df_plot.columns:
+                    ax4.plot(x_idx_plot, df_plot['MACD'], color='blue', linewidth=1.5, label='MACD')
+                    ax4.plot(x_idx_plot, df_plot['MACD_Signal'], color='orange', linewidth=1.5, label='Signal')
+                    if 'MACD_Hist' in df_plot.columns:
+                        colors = np.where(df_plot['MACD_Hist'] >= 0, 'green', 'red')
+                        ax4.bar(x_idx_plot, df_plot['MACD_Hist'], color=colors, alpha=0.6, width=0.6)
+                    ax4.axhline(0, color='black', linestyle='-', linewidth=1, alpha=0.5)
+                    ax4.set_ylabel('MACD', fontweight='bold', fontsize=9)
+                    ax4.legend(loc='upper left', fontsize=8, ncol=3)
+                    ax4.grid(True, linestyle='--', alpha=0.3)
+                else:
+                    ax4.set_visible(False)
 
                 # Final Layout
-
-
-                ax1.set_title(f"TECHNICAL ANALYSIS CHART: {ticker}", fontsize=14, fontweight='bold', color='darkblue')
-
-
                 ax1.grid(True, linestyle='--', alpha=0.3)
-
-
+                ax1.tick_params(labelright=True) # Ensure right-side price labels
                 ax1.legend(loc='upper left', fontsize=9, ncol=4)
-
-
-                ax1.set_xlim(mdates.date2num(df_ext['Date'].iloc[0]), mdates.date2num(df_ext['Date'].iloc[-1]))
-
-
+                
+                # Use FuncFormatter to map ordinal x back to Dates
+                import matplotlib.ticker as ticker_lib
+                ax4.xaxis.set_major_formatter(ticker_lib.FuncFormatter(format_date))
+                
+                # Make sure the x limits are bounded by the total ordinal length
+                ax1.set_xlim(0, len(x_idx_ext) + 2)
                 ax2.grid(True, linestyle='--', alpha=0.3)
-
-
-                ax1.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m'))
-
-
                 plt.show()
 
 
@@ -2826,66 +2791,36 @@ class TinvestApp:
 
 
                     has_signal = signals.get('entry_type', 'NONE') != 'NONE'
+                    val = evaluate_stock_valuation("INDEX", df_rich, signals)
+                    sr = {"s1": val.get("s1", 0), "s2": val.get("s2", 0),
+                          "r1": val.get("r1", 0), "r2": val.get("r2", 0)}
 
+                    # State Engine cho Index
+                    from tinvest.state_engine import evaluate_state_rules
+                    state_rules = evaluate_state_rules(df_rich)
 
-                    if has_signal:
-
-
-                        val = evaluate_stock_valuation("INDEX", df_rich, signals)
-
-
-                        sr = {"s1": val.get("s1", 0), "s2": val.get("s2", 0),
-
-
-                              "r1": val.get("r1", 0), "r2": val.get("r2", 0)}
-
-
-                    else:
-
-
-                        sr = calculate_index_sr(df_rich)
-
-
-                    
-
+                    res_regime = analyze_market_index(idx_df, breadth_pct_ma20=breadth_ma20, breadth_pct_ma50=breadth_ma50, momentum_data=mom)
+                    res_regime['price'] = float(idx_df['Close'].iloc[-1])
 
                     return {
-
-
-                        "regime": analyze_market_index(idx_df, breadth_pct_ma20=breadth_ma20, breadth_pct_ma50=breadth_ma50, momentum_data=mom),
-
-
+                        "regime": res_regime,
                         "momentum": mom,
-
-
                         "ichi": analyze_ichimoku(df_rich),
-
-
                         "vsa": analyze_vsa(df_rich),
-
-
                         "ma": analyze_ma_trend(df_rich),
-
-
                         "sr": sr,
-
-
                         "sr_source": "SIGNAL" if has_signal else "PIVOT",
-
-
                         "signals": signals,
-
-
+                        "valuation": val,
+                        "state_rules": state_rules,
                         "date": idx_df['Date'].iloc[-1].strftime("%Y-%m-%d") if 'Date' in idx_df.columns else "N/A"
-
-
                     }
 
 
 
 
 
-                def format_index(name, res_dict):
+                def format_index(name, res_dict, prefix=""):
 
 
                     if not res_dict or res_dict['regime']['regime'] == "UNKNOWN":
@@ -2927,7 +2862,8 @@ class TinvestApp:
                     
 
 
-                    txt = f"\n--- TỔNG QUAN {name} ({res['date']})"
+                    txt = f"\n{prefix}THỊ TRƯỜNG {name} ({res['date']})"
+                    txt += f"\n * CHỈ SỐ: {res['price']:,.2f}"
 
 
                     txt += f"\n * TRẠNG THÁI: {regime_label}"
@@ -2948,39 +2884,208 @@ class TinvestApp:
                     
 
 
-                    if res['ftd_active']: txt += f"\n   - FTD: Đang Kích Hoạt ({res.get('ftd_quality', 'N/A')})"
+                    if res['ftd_active']: 
+                        ftd_str = res.get('ftd_date', 'N/A')
+                        txt += f"\n   - XÁC NHẬN FTD: Đang Kích Hoạt (Từ phiên {ftd_str} - {res.get('ftd_quality', 'N/A')})"
 
 
-                    elif res['ra_day'] > 0: txt += f"\n   - Nỗ lực hồi phục (RA): Ngày thứ {res['ra_day']}"
-
-
+                    txt += f"\n   - Nỗ lực hồi phục (RA) : Ngày thứ {res['ra_day']}" if res['ra_day'] > 0 else ""
+                    txt += f"\n   - Ngày Phân Phối      : {res['distribution_count']} ngày\n"
                     
-
-
-                    txt += f"\n   - Ngày Phân Phối: {res['distribution_count']} ngày"
-
-
-                    txt += f"\n * VSA: {vsa['dominant']} | Ichi: {ichi['trend']} | MA: {ma['trend_label']}"
-
-
-                    txt += f"\n * RSI: {mom['rsi_val']} | MACD: {mom['macd_val']}"
-
-
+                    diag = res_dict.get('valuation', {}).get('tech_health', {}).get('diagnostics', {})
+                    if diag:
+                        ma_d = diag.get('ma', {})
+                        ichi_d = diag.get('ichimoku', {})
+                        rsi_d = diag.get('rsi', {})
+                        macd_d = diag.get('macd', {})
+                        adx_d = diag.get('adx', {})
+                        
+                        txt += "\n [2.1 CHẨN ĐOÁN CHỈ BÁO THỊ TRƯỜNG]"
+                        txt += f"\n   ● [MA] {ma_d.get('status', '')}"
+                        txt += f"\n   ● [MA Hành động] {ma_d.get('action', '')}"
+                        txt += f"\n   ● [Ichimoku] {ichi_d.get('status', '')}"
+                        txt += f"\n   ● [RSI Setup] {rsi_d.get('status', '')}"
+                        txt += f"\n   [MACD Setup] {macd_d.get('status', '')}"
+                        txt += f"\n   ● [ADX Setup] {adx_d.get('status', '')}\n"
+                    else:
+                        txt += f"\n * VSA: {vsa['dominant']} | Ichi: {ichi['trend']} | MA: {ma['trend_label']}"
+                        txt += f"\n * RSI: {mom['rsi_val']} | MACD: {mom['macd_val']}\n"
                     
-
-
                     sigs = res_dict.get('signals', {})
-
-
                     if sigs and sigs.get('entry_type') != "NONE":
-
-
                         txt += f"\n 🔥 TÍN HIỆU: {sigs['entry_type']} ({sigs['confidence']})"
-
-
                     
-
-
+                    # === STATE ENGINE: DAC DIEM TRANG THAI THI TRUONG ===
+                    st = res_dict.get('state_rules', {})
+                    alloc = "10-30%" # Default
+                    alloc_note = "Chưa xác định rõ"
+                    if st:
+                        pri_map = {"UPTREND": "Sóng Tăng mạnh", "DOWNTREND": "Sóng Giảm mạnh", "UPTREND_START": "Vừa bứt phá vào sóng Tăng", "DOWNTREND_START": "Vừa gãy nền vào sóng Giảm", "WEAK_UPTREND": "Tăng nhưng yếu dần", "WEAK_DOWNTREND": "Giảm nhẹ (đà rơi chậm lại)", "RECOVERY": "Giai đoạn HỒI PHỤC", "RANGE": "Đi biên ngang", "SQUEEZE": "Nén chặt biên hẹp", "NEUTRAL": "Trạng thái Trung tính", "SIDEWAY": "Đi ngang"}
+                        sec_map = {"PULLBACK": "Nhịp kéo ngược (chỉnh lành mạnh)", "FAILED_PULLBACK": "Kéo ngược thất bại (thủng nền)", "EXHAUSTION": "Đuối sức (nguy cơ đảo chiều)", "REVERSAL_BUILD": "Xây nền đảo chiều đáy", "ROLL_OVER": "Xác nhận gãy", "ACCUMULATION": "Gom hàng bám nền", "DISTRIBUTION": "Phân phối", "TRAP": "Bẫy giá (lùa gà)", "UNDER_PRESSURE": "Áp lực bán (Tiệm cận hỗ trợ)", "NORMAL": "Bình thường"}
+                        sig_map = {"BREAKOUT_BUY": "MUA BREAKOUT", "PULLBACK_BUY": "MUA PULLBACK", "TREND_FOLLOW": "ÔM TIẾP", "REVERSAL_BUY": "MUA BẮT ĐÁY", "TAKE_PROFIT": "CHỐT LÃI", "EXIT_OR_SHORT": "THOÁT HÀNG", "EXIT_FAST": "CHẠY NGAY", "SHORT": "Đứng ngoài", "NO_TRADE": "CẤM MUA", "NONE": "Chưa có tín hiệu"}
+                        
+                        st_pri = pri_map.get(st.get('primary', ''), st.get('primary', 'N/A'))
+                        st_sec = sec_map.get(st.get('secondary', ''), st.get('secondary', 'N/A'))
+                        st_sig = sig_map.get(st.get('signal', ''), st.get('signal', 'N/A'))
+                        st_conf = int(st.get('confidence', 0))
+                        st_avoid = st.get('avoid_entry', False)
+                        
+                        if st_conf >= 3: st_win = "Tốt (>= 70%)"
+                        elif st_conf == 2: st_win = "Khá (~ 60%)"
+                        elif st_conf >= 0: st_win = "Trung bình (~ 50%)"
+                        else: st_win = "Thấp (< 50%)"
+                        
+                        # Ty trong khuyen nghi: ket hop State Engine + FTD + Phan phoi
+                        st_pri_raw = st.get('primary', '')
+                        ftd_on = res['ftd_active']
+                        dist_n = res.get('distribution_count', 0)
+                        
+                        if st_pri_raw in ['UPTREND', 'UPTREND_START']:
+                            if ftd_on and dist_n <= 2:
+                                alloc = "80-100%"
+                                alloc_note = "Xu hướng mạnh, FTD xác nhận, phân phối ít -> ALL IN được"
+                            elif ftd_on and dist_n > 2:
+                                alloc = "60-80%"
+                                alloc_note = "Xu hướng tăng nhưng phân phối đang tăng -> vẫn giữ tỷ trọng cao nhưng sẵn sàng hạ"
+                            else:
+                                alloc = "60-80%"
+                                alloc_note = "Xu hướng tăng nhưng chưa có FTD xác nhận -> chưa nên full"
+                        elif st_pri_raw == 'WEAK_UPTREND':
+                            if ftd_on:
+                                alloc = "50-70%"
+                                alloc_note = "Tăng yếu dần nhưng FTD còn sống -> canh giữ, giảm dần nếu chớm gãy"
+                            else:
+                                alloc = "30-50%"
+                                alloc_note = "Tăng yếu dần, không có FTD -> cẩn thận chuyển giao"
+                        elif st_pri_raw in ['RANGE', 'SQUEEZE', 'SIDEWAY', 'NEUTRAL']:
+                            if ftd_on:
+                                alloc = "50-70%"
+                                alloc_note = "Đang tích lũy/chuyển giao trong nhịp hồi có FTD -> ưu tiên nắm giữ cổ phiếu Leader"
+                            else:
+                                alloc = "20-40%"
+                                alloc_note = "Chưa rõ xu hướng, đang tích lũy/trung tính -> giữ tiền mặt chờ xác nhận"
+                        elif st_pri_raw == 'WEAK_DOWNTREND':
+                            if ftd_on:
+                                alloc = "40-60%"
+                                alloc_note = "Nhịp điều chỉnh/nghỉ chân trong đà hồi phục có FTD -> CƠ HỘI GOM HÀNG"
+                            elif dist_n >= 3:
+                                alloc = "0-15%"
+                                alloc_note = "Giảm nhẹ + phân phối nhiều -> RỦI RO CAO, BÁN HẠ TỶ TRỌNG gấp"
+                            else:
+                                alloc = "15-30%"
+                                alloc_note = "Điều chỉnh bình thường -> giữ ít, chờ xem có giữ nền không"
+                        elif st_pri_raw in ['DOWNTREND', 'DOWNTREND_START']:
+                            alloc = "0-10%"
+                            alloc_note = "Gãy xu hướng xác nhận -> BÁN SẠCH, RA NGOÀI"
+                        elif st_pri_raw == 'RECOVERY':
+                            if ftd_on:
+                                alloc = "50-75%"
+                                alloc_note = "Hồi phục ổn định có FTD -> ưu tiên nắm giữ & quan sát điểm gia tăng"
+                            else:
+                                alloc = "20-40%"
+                                alloc_note = "Hồi phục kỹ thuật, chưa có FTD -> chỉ nên test tỷ trọng nhỏ"
+                        else:
+                            # Unify with regime if possible
+                            reg = res['regime']
+                            if reg == "STABLE_RECOVERY":
+                                alloc, alloc_note = "50-75%", "Hồi phục ổn định trên MA20"
+                            elif reg == "RECOVERY":
+                                alloc, alloc_note = "30-50%", "Đang nỗ lực hồi phục"
+                            else:
+                                alloc = "10-30%"
+                                alloc_note = "Chưa xác định rõ -> giữ ít phòng thủ"
+                        
+                        # Override boi avoid
+                        if st_avoid:
+                            alloc = "0-10%"
+                            alloc_note = "Bộ Lọc Rủi Ro đang BẬT -> CẤM MUA MỚI"
+                        
+                        m = st.get('metrics', {})
+                        
+                        txt += "\n\n [2.2 ĐẶC ĐIỂM TRẠNG THÁI THỊ TRƯỜNG (ROBOT)]"
+                        txt += f"\n   ● Xu Hướng Cốt Lõi    : {st_pri}"
+                        txt += f"\n   ● Hành Vi Vận Động     : {st_sec}"
+                        txt += f"\n   ● Tín Hiệu Khuyến Nghị: {st_sig}"
+                        txt += f"\n   ● Xác Suất Thắng      : {st_win} (Hệ số: {st_conf})"
+                        txt += f"\n   ● Tỷ Trọng Khuyên     : {alloc} cổ phiếu ({alloc_note})"
+                        if m:
+                            txt += f"\n   ● ADX: {m.get('adx',0):.1f} | MACD Hist: {m.get('hist',0):.2f} | Vol Spike: {m.get('vol_spike', False)} | Trend Bias: {m.get('trend_bias', 0)}"
+                    
+                    txt += "\n\n 🎯 TỔNG KẾT CHIẾN LƯỢC TỪ AI:"
+                    reg = res['regime']
+                    s1_val = f"{sr['s1']:,.2f}" if sr['s1'] > 0 else 'N/A'
+                    s2_val = f"{sr['s2']:,.2f}" if sr['s2'] > 0 else 'N/A'
+                    r1_val = f"{sr['r1']:,.2f}" if sr['r1'] > 0 else 'N/A'
+                    r2_val = f"{sr['r2']:,.2f}" if sr['r2'] > 0 else 'N/A'
+                    dist_count = res.get('distribution_count', 0)
+                    ra_day = res.get('ra_day', 0)
+                    ftd_quality = res.get('ftd_quality', 'N/A')
+                    
+                    # Tinh SL cho Index dua tren S1
+                    sl_idx = f"{sr['s1'] * 0.99:,.2f}" if sr['s1'] > 0 else 'N/A'
+                    
+                    if res['ftd_active']:
+                        if reg in ["UPTREND", "STABLE_RECOVERY"]:
+                            txt += f"\n  👉 THỊ TRƯỜNG [{reg}] - FTD XÁC NHẬN + ĐỒNG THUẬN TĂNG. MÔI TRƯỜNG THUẬN LỢI."
+                            txt += f"\n     - Phân Bổ Tỷ Trọng      : Duy trì {alloc} cổ phiếu. Ưu tiên mã đang dẫn dắt (Leader)."
+                            txt += f"\n     - 🛒 Vùng Mua Gia Tăng   : Nhặt thêm hàng khi Index test lại hỗ trợ {s1_val}. Mạnh dạn gom nếu về {s2_val}."
+                            txt += f"\n     - 🎯 Vùng Chốt Một Phần  : Tỉa lộc khi Index chạm cản {r1_val} - {r2_val}. Không bán sạch khi trend còn sống."
+                            txt += f"\n     - ✂ Báo Động Đỏ Khi Nào? : Nếu Index đóng cửa thủng hỗ trợ {s1_val} kèm Volume lớn -> Hạ về 50% tiền mặt ngay."
+                        
+                        elif reg == "UPTREND_UNDER_PRESSURE":
+                            txt += f"\n  👉 THỊ TRƯỜNG [{reg}] - CÓ FTD NHƯNG ÁP LỰC BÁN ĐANG TĂNG ({dist_count} phiên phân phối)."
+                            txt += f"\n     - ⚠️ HÀNH ĐỘNG NGAY      : BÁN BỚT HÀNG YẾU NGAY HÔM NAY. Không chờ hồi lên cản mới bán!"
+                            txt += f"\n     - Cơ Cấu Danh Mục        : Loại bỏ ngay các mã gãy MA20 / mã thua lỗ nhiều. Chỉ giữ {alloc} cổ phiếu Leader khỏe."
+                            txt += f"\n     - 🛡️ Kịch Bản Xấu Nhất   : Nếu Index thủng {s1_val} -> GIỮ TIỀN MẶT 70%+. Hàng yếu sẽ rớt gấp 2-3 lần Index."
+                            txt += f"\n     - 🛒 Mua Mới Được Không?  : CẤM FOMO. Chỉ test lượng nhỏ nếu Index đạp chuẩn về sâu {s2_val} rồi nảy lên giữ được."
+                            txt += f"\n     - 📌 FTD Còn Sống Không?  : FTD ({ftd_quality}) sẽ BỊ HỦY nếu Index đóng cửa dưới mốc FTD cũ. Lúc đó -> chuyển sang DOWNTREND."
+                        
+                        elif reg == "RECOVERY":
+                            txt += f"\n  👉 THỊ TRƯỜNG [{reg}] - FTD VỪA KÍCH HOẠT, MỚI VƯỢT MA10. CÒN SỚM ĐỂ BẮT ĐÁY MẠNH."
+                            txt += f"\n     - Phân Bổ Tỷ Trọng      : Giữ {alloc} cổ phiếu. Test hàng nhỏ ở mã Leader."
+                            txt += f"\n     - 🛒 Mua Ở Đâu?          : Chỉ nhặt khi Index duy trì trên {s1_val}. Nếu xé rào vượt {r1_val} kèm vol -> tăng lên 50%."
+                            txt += f"\n     - ✂ Stoploss Cho Cả Port : Rút về 10% cổ phiếu nếu Index quay đầu thủng {sl_idx}."
+                        
+                        else:  # WEAK_RECOVERY hoac cac trang thai FTD khac
+                            txt += f"\n  👉 THỊ TRƯỜNG [{reg}] - FTD CÓ NHƯNG XUNG LỰC CHƯA RÕ. MÔI TRƯỜNG TRUNG TÍNH."
+                            txt += f"\n     - Mua Dò Đường           : Giải ngân {alloc} test vị thế nhỏ khi Index nén quanh {s1_val}."
+                            txt += f"\n     - Chờ Xác Nhận           : Chỉ tăng tỷ trọng lên 50%+ khi Index vượt {r1_val} kèm thanh khoản rõ ràng."
+                            txt += f"\n     - ✂ Rút Lui Nếu          : Index đóng cửa dưới {sl_idx} -> xoá vị thế test, giữ tiền mặt chờ."
+                    else:
+                        if ra_day > 0:
+                            txt += f"\n  👉 THỊ TRƯỜNG [ĐANG NỖ LỰC HỒI PHỤC - RA Ngày {ra_day}] - CHỜ XÁC NHẬN FTD."
+                            txt += f"\n     - Tình Trạng             : Thị trường đang cố ngưng rơi nhưng CHƯA CÓ FTD. Mọi nhịp hồi đều có thể là bẫy."
+                            txt += f"\n     - Tỷ Trọng Khuyên        : Giữ {alloc} cổ phiếu (toàn mã cực khỏe)."
+                            txt += f"\n     - 🛒 Canh Mua Test        : Mua mồi 10% ở mã Leader nền đẹp khi Index đang test hỗ trợ {s1_val}."
+                            txt += f"\n     - ⚡ Khi Nào Tăng Tỷ Trọng: Chờ FTD xuất hiện (Volume bùng nổ > TB20 + Close tăng > 1.5%). Khi đó mới nâng lên 40%."
+                            txt += f"\n     - ✂ Đổ Máu Khi Nào?      : Nếu Index thủng đáy cũ {s2_val} -> BÁN SẠCH, RA NGOÀI HOÀN TOÀN."
+                        elif reg == "MARKET_WEAKENING":
+                            txt += f"\n  👉 THỊ TRƯỜNG [{reg}] - ĐÀ TĂNG CHẤM DỨT, BẮT ĐẦU SUY YẾU."
+                            txt += f"\n     - ⚠️ HÀNH ĐỘNG NGAY      : Cắt bỏ mã yếu NGAY LẬP TỨC. Không đợi hồi, không gồng."
+                            txt += f"\n     - Tỷ Trọng Phòng Thủ     : Tối đa {alloc} cổ phiếu. Chỉ giữ mã còn trên MA50."
+                            txt += f"\n     - 🔪 Người Kẹp Hàng Nặng : Canh bất kỳ nhịp kéo ảo nào chạm gần {r1_val} -> BÁN XẢ giảm tải. Đừng hy vọng."
+                            txt += f"\n     - 🛒 Mua Lại Khi Nào?    : Chỉ khi Index đạp rã thật sâu về tận {s2_val} + xuất hiện FTD mới."
+                        elif reg == "SIDEWAY":
+                            txt += f"\n  👉 THỊ TRƯỜNG [{reg}] - ĐI NGANG BIÊN HẸP, KHÔNG CÓ XU HƯỚNG RÕ."
+                            txt += f"\n     - Chiến Lược             : SWING TRADE biên. Mua sát {s1_val}, bán sát {r1_val}."
+                            txt += f"\n     - Tỷ Trọng               : {alloc} cổ phiếu, ưu tiên mã có câu chuyện riêng."
+                            txt += f"\n     - ✂ Rào Chắn             : Thủng {s2_val} -> chuyển sang phòng thủ 100% tiền mặt."
+                        else:  # DOWNTREND / UNKNOWN
+                            txt += f"\n  👉 THỊ TRƯỜNG [{reg}] - DOWNTREND / RỦI RO LỚN. ƯU TIÊN ÔM TIỀN MẶT."
+                            txt += f"\n     - ⛔ LỆNH CẤM             : TUYỆT ĐỐI KHÔNG BẮT ĐÁY. Mọi nhịp hồi đều là bẫy Bull Trap."
+                            txt += f"\n     - ✂ Cắt Lỗ Kỷ Luật       : Bán tháo toàn bộ mã yếu, mã thua lỗ. Không ngoại lệ."
+                            txt += f"\n     - 🔪 Canh Xả Hàng Kẹp    : Nếu có nhịp Bull Trap nảy lên sát {r1_val} -> thoát sạch. Đây là CƠ HỘI VÀNG để chạy."
+                            txt += f"\n     - 🛒 Vùng Cứu Trợ        : Chỉ quay lại thị trường khi Index đạp cạn kiệt về tận {s2_val} + FTD mới xác nhận."
+                        
+                    # Dong tong ket tu State Engine
+                    if st:
+                        txt += f"\n\n  📊 ĐÁNH GIÁ TỔNG HỢP TỪ ROBOT:"
+                        txt += f"\n     Xu hướng: {st_pri} | Hành vi: {st_sec} | Tín hiệu: {st_sig}"
+                        txt += f"\n     Xác suất tiếp diễn xu hướng hiện tại: {st_win}"
+                        txt += f"\n     ➡️ TỶ TRỌNG KHUYẾN NGHỊ: NẮM GIỮ {alloc} CỔ PHIẾU."
+                        if st_avoid:
+                            txt += f"\n     ⛔ BỘ LỌC RỦI RO: ĐANG BẬT - TUYỆT ĐỐI KHÔNG MUA MỚI."
+                    
                     return txt
 
 
@@ -3005,58 +3110,27 @@ class TinvestApp:
                 
 
 
-                report = ["="*60, "     BÁO CÁO TOÀN CẢNH THỊ TRƯỜNG CHUNG (MARKET REGIME)", "="*60]
-
-
-                report.append(f"\n1. ĐỘ RỘNG THỊ TRƯỜNG (BREADTH): {breadth_res['breadth_label']}")
-
-
+                report = []
+                report.append("\n" + "="*60)
+                report.append(f"💎 ĐÁNH GIÁ TỔNG QUAN THỊ TRƯỜNG - {vn_full['date']} - AIC code! 💎")
+                report.append(f"A. ĐỘ RỘNG THỊ TRƯỜNG (BREADTH): {breadth_res['breadth_label']}")
                 report.append(f" - Tổng mã quét: {breadth_res['total_scanned']}")
-
-
                 report.append(f" - Tỷ lệ mã > MA20: {breadth_res.get('strong_stocks_ma20_pct', 'N/A')}%")
-
-
                 report.append(f" - Tỷ lệ mã > MA50: {breadth_res['strong_stocks_pct']}%")
-
-
                 
+                report.append("\n" + "="*60)
+                report.append(format_index(vn_key, vn_full, prefix="B. "))
+                if hn_full:
+                    report.append("\n" + "="*60)
+                    report.append(format_index(hn_key, hn_full, prefix="C. "))
 
-
-                report.append(format_index(vn_key, vn_full).replace("---", "2."))
-
-
-                if hn_full: report.append(format_index(hn_key, hn_full).replace("---", "3."))
+                report.append("\n" + "="*60)
 
 
                     
 
 
-                report.extend(["\n" + "="*60, "CHIẾN LƯỢC HÀNH ĐỘNG THEO TRẠNG THÁI:", "─"*60,
-
-
-                               "- UPTREND: 100% tỷ trọng, MA20 > MA50 & Giá > MA50.",
-
-
-                               "- UPTREND RỦI RO: Có phân phối hoặc MA20 < MA50. Chốt lời dần.",
-
-
-                               "- HỒI PHỤC ỔN ĐỊNH: Có FTD & vượt MA20/Kijun. Tăng tỷ trọng 50-75%.",
-
-
-                               "- HỒI PHỤC: Có FTD & vượt MA10. Thăm dò 10-20%.",
-
-
-                               "- HỒI PHỤC YẾU: Có từ 3 phiên nỗ lực hồi phục. Theo dõi FTD.",
-
-
-                               "- SIDEWAY: Đi ngang biên ±5% quanh MA50. Swing trade.",
-
-
-                               "- SUY YẾU: Giá nằm dưới MA50. Co cụm danh mục.",
-
-
-                               "- DOWNTREND: Thị trường giảm giá > 10%. Đứng ngoài."])
+                report.append("\n" + "="*60)
 
 
                 
@@ -3209,13 +3283,36 @@ class TinvestApp:
             df_vn = self.data_dict.get(vn_key)
             if df_vn is not None and not df_vn.empty:
                 # Align VNINDEX data with the plot dataframe dates
-                df_vn_plot = df_vn.loc[df_vn.index.isin(df_plot.index)]
+                # df_vn has sequential numerical index and a 'Date' column. df_plot has Date string index.
+                df_vn_indexed = df_vn.copy()
+                df_vn_indexed['DateStr'] = pd.to_datetime(df_vn_indexed['Date']).dt.strftime('%Y-%m-%d')
+                df_vn_indexed = df_vn_indexed.set_index('DateStr')
+                
+                df_plot_dates = pd.to_datetime(df_plot.index).strftime('%Y-%m-%d')
+                common_dates = df_plot_dates.intersection(df_vn_indexed.index)
+                
+                df_vn_plot = df_vn_indexed.loc[common_dates]
                 if not df_vn_plot.empty:
                     ax2 = ax1.twinx()
-                    line3, = ax2.plot(dates, df_vn_plot['Close'], color='grey', alpha=0.35, 
-                                     linestyle='--', linewidth=1.5, label='VNINDEX (Price)')
-                    ax2.set_ylabel('Điểm số VNINDEX', color='grey', fontsize=10)
-                    ax2.tick_params(axis='y', labelcolor='grey')
+                    
+                    up = df_vn_plot[df_vn_plot['Close'] >= df_vn_plot['Open']]
+                    down = df_vn_plot[df_vn_plot['Close'] < df_vn_plot['Open']]
+                    
+                    # Candlestick Bodies
+                    ax2.bar(mdates.date2num(pd.to_datetime(up.index)), up['Close'] - up['Open'], bottom=up['Open'], color='white', edgecolor='#455A64', linewidth=1.2, width=0.6, alpha=0.9, zorder=3)
+                    ax2.bar(mdates.date2num(pd.to_datetime(down.index)), down['Open'] - down['Close'], bottom=down['Close'], color='#455A64', edgecolor='#455A64', width=0.6, alpha=0.9, zorder=3)
+                    
+                    # Candlestick Wicks
+                    ax2.vlines(mdates.date2num(pd.to_datetime(up.index)), up['Low'], up['High'], color='#455A64', linewidth=1.2, zorder=2)
+                    ax2.vlines(mdates.date2num(pd.to_datetime(down.index)), down['Low'], down['High'], color='#455A64', linewidth=1.2, zorder=2)
+                    
+                    # Dummy line for legend
+                    import matplotlib.lines as mlines
+                    line3 = mlines.Line2D([], [], color='#455A64', marker='s', linestyle='None', markersize=8, label='VNINDEX (Candles)')
+                    
+                    ax2.set_ylabel('Điểm số VNINDEX', color='#455A64', fontsize=10, fontweight='bold')
+                    ax2.tick_params(axis='y', labelcolor='#455A64')
+                    ax2.grid(False) # avoid overlapping grid
                     
                     # Combine legends
                     lines = [line1, line2, line3]

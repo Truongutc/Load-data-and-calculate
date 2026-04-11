@@ -6,6 +6,7 @@ Runs the full TINVEST pipeline on a single ticker and produces a conversational,
 
 import logging
 import pandas as pd
+import numpy as np
 
 from .ichimoku_engine import analyze_ichimoku
 from .vsa_engine       import analyze_vsa
@@ -14,6 +15,7 @@ from .advanced_entry   import classify_entry
 from .accumulation_engine import analyze_accumulation
 from .valuation_engine import evaluate_stock_valuation
 from .data_loader import enrich_dataframe
+from .state_engine import evaluate_state_rules
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,9 @@ def analyze_stock(ticker: str, df: pd.DataFrame) -> dict:
     # 3. Valuation & Risk Management (AIC Style)
     valuation = evaluate_stock_valuation(ticker, df_rich, adv)
     
+    # 4. Master State Engine (Rule Trạng Thái)
+    state_rules = evaluate_state_rules(df_rich)
+    
     # Store close_26 for Chikou analysis in report
     close_26 = df_rich['Close'].iloc[-26] if len(df_rich) > 26 else df_rich['Close'].iloc[0]
 
@@ -49,6 +54,7 @@ def analyze_stock(ticker: str, df: pd.DataFrame) -> dict:
         "adv": adv,
         "accum": accum,
         "valuation": valuation,
+        "state_rules": state_rules,
         "close_26": float(close_26),
         "ma20": float(df_rich['MA20'].iloc[-1]),
         "ma50": float(df_rich['MA50'].iloc[-1])
@@ -76,11 +82,69 @@ def format_report(result: dict) -> str:
     sl1, sl2 = val.get("cutloss_partial", 0), val.get("cutloss_full", 0)
     ts = val.get("trailing_stop", 0)
     bb = val.get("break_buy", 0)
+    
     rs = val.get("risk_score", 0)
-    rd = val.get("risk_desc", "N/A")
+    rd = val.get("risk_desc", "LOW")
+    opp = val.get("opp_score", 0)
+    opp_desc = val.get("opp_desc", "Trung bình")
+    
     rr = val.get("rr_ratio", 0)
     action = val.get("action", "WAIT")
-    state = val.get("state", "UNKNOWN")
+    state = val.get("state", "NONE")
+    
+    state_rules = result.get("state_rules", {})
+    m = state_rules.get("metrics", {})
+    
+    # Dich thuat
+    pri_raw = state_rules.get("primary", "")
+    sec_raw = state_rules.get("secondary", "")
+    # Mapping nhãn trạng thái (Bỏ hoàn toàn TRANSITION)
+    regime = {"TREND": "Có xu hướng Rõ Ràng", "RANGE": "Đang đi biên ngang", "SQUEEZE": "Nén chặt (Chờ nổ)", "SIDEWAY": "Đi ngang"}.get(state_rules.get("regime", ""), state_rules.get("regime", "N/A"))
+    primary = {"UPTREND": "Sóng Tăng Uy Tín", "DOWNTREND": "Sóng Giảm Rủi Ro", "UPTREND_START": "Vừa bứt phá vào sóng Tăng", "DOWNTREND_START": "Vừa gãy nền vào sóng Giảm", "WEAK_UPTREND": "Tăng nhưng còn yếu", "WEAK_DOWNTREND": "Giảm yếu (Đà rơi chậm lại)", "RANGE": "Đi biên đi ngang", "SQUEEZE": "Nén chặt biên hẹp", "RECOVERY": "Giai đoạn HỒI PHỤC", "NEUTRAL": "Trạng thái Trung tính"}.get(pri_raw, pri_raw or "N/A")
+    secondary = {"PULLBACK": "Nhịp chỉnh lành mạnh (Kéo ngược)", "RETEST": "Kiểm tra lại đỉnh/cản (Retest)", "FAILED_PULLBACK": "Kéo giật thất bại (Thủng nền)", "EXHAUSTION": "Đuối sức (Nguy cơ đảo chiều)", "REVERSAL_BUILD": "Xây nền đảo chiều đáy", "ROLL_OVER": "Xác nhận Rơi / Gãy", "ACCUMULATION": "Gom hàng bám nền", "DISTRIBUTION": "Dấu hiệu phân phối", "TRAP": "Có bẫy giá (Lùa gà nổ Vol)", "UNDER_PRESSURE": "Áp lực bán (Tiệm cận hỗ trợ)", "NORMAL": "Trạng thái bình thường"}.get(state_rules.get("secondary", ""), state_rules.get("secondary", "N/A"))
+    
+    # Logic cho Tín hiệu (Ưu tiên tín hiệu đang nắm giữ - Holding)
+    sig_map = {
+        "STRONG": "Mua mạnh (Trend Leader)",
+        "ADD_2": "Gia tăng vị thế 2 (Confirm)",
+        "ADD_1": "Gia tăng vị thế 1 (Pullback)",
+        "EARLY": "Mua sớm (Thăm dò)",
+        "NONE": "Chưa có tín hiệu dứt khoát"
+    }
+    holding_sig = sig_map.get(state, "Chưa có tín hiệu dứt khoát")
+    
+    # Kết hợp với tín hiệu bùng nổ realtime (nếu có từ Master State Engine)
+    rt_sig_map = {
+        "BREAKOUT_BUY": "MUA BREAKOUT (Tiền tấn công)", 
+        "PULLBACK_BUY": "MUA PULLBACK (Tiền gốc)", 
+        "RETEST_BUY": "MUA RETEST (Điểm Giàu)", 
+        "CONTINUATION_BUY": "GIA TĂNG (Trend Confirm)", 
+        "TREND_FOLLOW": "ÔM TIẾP (Theo sóng)", 
+        "TAKE_PROFIT": "CHỐT LÃI (Canh nhả hàng)", 
+        "EXIT_OR_SHORT": "THOÁT HÀNG (Rủi ro)", 
+        "EXIT_FAST": "CHẠY NGAY (Bẫy giá)", 
+        "SHORT": "Đứng ngoài hoàn toàn"
+    }
+    realtime_sig = rt_sig_map.get(state_rules.get("signal", ""), "")
+    
+    if realtime_sig:
+        sr_signal = realtime_sig
+    else:
+        sr_signal = holding_sig
+    conf = int(state_rules.get("confidence", 0))
+    if conf >= 3:
+        win_rate = "Tốt (Tỉ lệ thắng >= 70%)"
+    elif conf == 2:
+        win_rate = "Khá (Tỉ lệ thắng ~ 60%)"
+    else:
+        win_rate = "Thấp (Nhiều rủi ro < 50%)"
+
+    avoid_entry = state_rules.get("avoid_entry", False)
+    
+    # Đè Tín hiệu Mua bằng RISK FILTER (Chặn Ngu)
+    if avoid_entry and (sr_signal.startswith("MUA") or sr_signal.startswith("GIA TĂNG")):
+        if m.get("anti_trap_block"):
+            sr_signal = "BLOCK (Rủi ro Fomo: Đợi chỉnh)"
 
     sep = "=" * 70
     sep2 = "-" * 70
@@ -94,71 +158,56 @@ def format_report(result: dict) -> str:
         ""
     ]
 
-    # --- 1. PHÂN TÍCH INDICATOR (GIẢI THÍCH BẮT BUỘC) ---
-    lines.append("  [1. PHÂN TÍCH INDICATOR - GIẢI THÍCH KỸ THUẬT]")
-    
-    # MA Explanation
-    ma_state = "Tích cực (Giá > MA20)" if price >= result.get("ma20", 0) else "Tiêu cực (Giá < MA20)"
-    lines.append(f"  ● Moving Average: {ma_state}")
-    lines.append("    - Ý nghĩa: MA20 là 'sợi dây sinh mệnh'. Giá trên MA20 là xu hướng ngắn hạn tăng.")
-    if ma_trend.get("is_perfect_uptrend"):
-        lines.append("    - Cấu trúc: MA10 > 20 > 50 > 100 (Perfect Trend) - Dòng tiền đang vào rất mạnh.")
-    
-    # Ichimoku Explanation
-    tenkan, kijun = ichi.get("tenkan", 0), ichi.get("kijun", 0)
-    tk_label = "Tích cực (Tenkan > Kijun)" if tenkan >= kijun else "Yếu (Tenkan < Kijun)"
-    if ichi.get("tenkan_kijun_cross") == 'bullish': 
-        tk_label = "BÙNG NỔ (Vừa Giao cắt Vàng T-K)"
-        
-    kumo_pos = "Uptrend (Trên mây)" if ichi.get("price_vs_kumo") == 'above' else ("Sideway (Trong mây)" if ichi.get("price_vs_kumo") == 'inside' else "Downtrend (Dưới mây)")
-    lines.append(f"  ● Ichimoku: {kumo_pos} | Momentum: {tk_label}")
-    lines.append(f"    - Chi tiết: Tenkan ({tenkan:,.2f}) | Kijun ({kijun:,.2f})")
-    lines.append("    - Ý nghĩa: Tenkan/Kijun thể hiện xung lực. Giá trên mây xác nhận chu kỳ tăng dài hạn.")
-    
-    # Chikou Explanation
-    chikou_status = "Thông thoáng (Clear)" if price > result.get("close_26", 0) else "Bị cản (Blocked)"
-    lines.append(f"  ● Chikou Span: {chikou_status}")
-    lines.append("    - Ý nghĩa: Chikou không bị giá quá khứ cản sẽ giúp trend 'sạch', ít rung lắc.")
-
-    # Kijun65 Explanation
-    k65 = val.get("details", {}).get("k65", 0)
-    k65_status = "Khỏe (Giá > Kijun65)" if price > k65 else "Rủi ro (Giá < Kijun65)"
-    lines.append(f"  ● Dao Găm 65: {k65_status} ({k65:,.2f})")
-    lines.append("    - Ý nghĩa: Là mức hỗ trợ/kháng cự tâm lý trung hạn cực kỳ quan trọng.")
+    # --- 1. PHÂN TÍCH KỸ THUẬT ---
+    lines.append("  [1. PHÂN TÍCH CHỈ BÁO & SETUP HÀNH ĐỘNG]")
+    if tech:
+        lines.append(f"  ● Tổng quan kỹ thuật: {tech.get('health_rating', 'BÌNH THƯỜNG')} (Điểm đánh giá: {tech.get('health_score', 0)}/100)")
+        diag = tech.get('diagnostics', {})
+        if diag:
+            lines.append("\n  [HỆ THỐNG ĐƯỜNG TRUNG BÌNH - MA]")
+            ma_d = diag.get('ma', {})
+            lines.append(f"  ● Nhận định: {ma_d.get('status', 'N/A')}")
+            lines.append(f"  ● Hành động: {ma_d.get('action', 'N/A')}")
+            
+            lines.append("\n  [HỆ THỐNG MÂY ICHIMOKU]")
+            ichi_d = diag.get('ichimoku', {})
+            lines.append(f"  ● Nhận định: {ichi_d.get('status', 'N/A')}")
+            lines.append(f"  ● Hành động: {ichi_d.get('action', 'N/A')}")
+            
+            lines.append(f"\n  [CHỈ BÁO ĐỘNG LƯỢNG - RSI ({tech.get('rsi_label', 'N/A')})]")
+            rsi_d = diag.get('rsi', {})
+            lines.append(f"  ● Setup    : {rsi_d.get('status', 'N/A')}")
+            lines.append(f"  ● Khuyến nghị: {rsi_d.get('action', 'N/A')}")
+            
+            lines.append(f"\n  [CHỈ BÁO DÒNG TIỀN - MACD ({tech.get('macd_label', 'N/A')})]")
+            macd_d = diag.get('macd', {})
+            lines.append(f"  ● Setup    : {macd_d.get('status', 'N/A')}")
+            lines.append(f"  ● Khuyến nghị: {macd_d.get('action', 'N/A')}")
+            
+            lines.append(f"\n  [XUNG LỰC XU HƯỚNG - ADX ({tech.get('adx_label', 'N/A')})]")
+            adx_d = diag.get('adx', {})
+            lines.append(f"  ● Setup    : {adx_d.get('status', 'N/A')}")
+            lines.append(f"  ● Khuyến nghị: {adx_d.get('action', 'N/A')}")
     lines.append("")
 
-    # --- 1.1 HỆ THỐNG ĐÁNH GIÁ SỨC MẠNH KỸ THUẬT (NEW) ---
-    if tech:
-        lines.append("  [1.1 HỆ THỐNG ĐÁNH GIÁ SỨC MẠNH KỸ THUẬT]")
-        lines.append(f"  ● Tổng quan sức khỏe : {tech.get('health_rating', 'BÌNH THƯỜNG')}")
-        lines.append(f"  ● Chỉ báo ADX        : {tech.get('adx_label', 'N/A')}")
-        lines.append(f"  ● Chỉ báo RSI        : {tech.get('rsi_label', 'N/A')}")
-        lines.append(f"  ● Chỉ báo MACD       : {tech.get('macd_label', 'N/A')}")
-        lines.append("    - Ý nghĩa: ADX đo lực xu hướng, RSI đo xung lực momentum, MACD đo hướng đi dòng tiền.")
+    # --- 1.5 CĂN CỨ TÍN HIỆU ---
+    if m:
+        lines.append("  [1.5 BIỆN LUẬN LÝ DO (TÍN HIỆU CƠ SỞ CHẨN ĐOÁN)]")
+        lines.append(f"  ● ADX (Xung lực): {m.get('adx', 0):.2f} (Chop: {m.get('chop', False)}) | Biên độ giá: {m.get('range_width', 0):.2f} / ATR: {m.get('atr', 0):.2f}")
+        lines.append(f"  ● Cấu Trúc (S_Bias): {m.get('structure_bias', 0)} | Xu Hướng (T_Bias): {m.get('trend_bias', 0)} (Trend Khoẻ: {m.get('strong_trend', False)})")
+        lines.append(f"  ● Động Lượng MACD: {m.get('macd', 0):.2f} | Hist: {m.get('hist', 0):.2f}")
+        lines.append(f"  ● Thanh Khoản (Vol): Spike={m.get('vol_spike', False)} | Dry={m.get('vol_dry', False)}")
+        lines.append(f"  ● Điểm Nổ Nến: Breakout_Up={m.get('breakout_up', False)} | Nến Lực={m.get('strong_candle', False)}")
         lines.append("")
 
-    # --- 2. XÁC ĐỊNH TRẠNG THÁI CỔ PHIẾU ---
-    lines.append("  [2. XÁC ĐỊNH TRẠNG THÁI CỔ PHIẾU]")
-    lines.append(f"  ● Trạng thái : {state.replace('_', ' ')}")
-    lines.append(f"  ● Vùng giá   : {val.get('position', 'N/A')}")
-    state_desc = {
-        "STRONG_UPTREND": "Dòng tiền áp đảo, xu hướng và xung lực đều chuẩn mức.",
-        "UPTREND": "Uptrend sóng ngắn, đang hướng lên nhưng cần tích lũy thêm.",
-        "SIDEWAY": "Giá đang tích lũy hoặc kịp giữa các vùng EMA/Cloud.",
-        "DOWNTREND": "Rơi tự do, mọi chỉ báo đều gãy, rủi ro cực cao."
-    }
-    lines.append(f"  ● Nhận định  : {state_desc.get(state, 'Chưa xác định rõ xu hướng.')}")
-    lines.append("")
-
-    # --- 2.1 TÍCH LŨY NỀN (ACCUMULATION) ---
-    accum = result.get("accum", {})
-    if accum.get("is_accumulation"):
-        lines.append("  [2.1 TÍCH LŨY NỀN - CONSOLIDATION]")
-        lines.append(f"  ● Trạng thái : ĐANG TÍCH LŨY ({accum.get('base_quality', 'MEDIUM')})")
-        if accum.get("notes"):
-            lines.append(f"  ● Ghi chú    : {', '.join(accum['notes'])}")
-        if accum.get("ready_to_break"):
-            lines.append("  ★ CẢNH BÁO : Nền siết chặt, sẵn sàng bùng nổ (Breakout Ready)!")
+    # --- 2. HỆ THỐNG CĂN CỨ TÍN HIỆU ---
+    if m:
+        lines.append("  [2. BIỆN LUẬN LÝ DO (TÍN HIỆU CƠ SỞ CHẨN ĐOÁN)]")
+        lines.append(f"  ● ADX (Xung lực): {m.get('adx', 0):.2f} (Chop: {m.get('chop', False)}) | Biên độ giá: {m.get('range_width', 0):.2f} / ATR: {m.get('atr', 0):.2f}")
+        lines.append(f"  ● Cấu Trúc (S_Bias): {m.get('structure_bias', 0)} | Xu Hướng (T_Bias): {m.get('trend_bias', 0)} (Trend Khoẻ: {m.get('strong_trend', False)})")
+        lines.append(f"  ● Động Lượng MACD: {m.get('macd', 0):.2f} | Hist: {m.get('hist', 0):.2f}")
+        lines.append(f"  ● Thanh Khoản (Vol): Spike={m.get('vol_spike', False)} | Dry={m.get('vol_dry', False)}")
+        lines.append(f"  ● Điểm Nổ Nến: Breakout_Up={m.get('breakout_up', False)} | Nến Lực={m.get('strong_candle', False)}")
         lines.append("")
 
     # --- 3. MỨC GIÁ QUAN TRỌNG ---
@@ -168,41 +217,130 @@ def format_report(result: dict) -> str:
     lines.append(f"  ● Kháng cự (R): R1: {r1:,.2f} | R2: {r2:,.2f}")
     lines.append("")
 
-    # --- 4. HÀNH ĐỘNG (ACTIONABLE) ---
+    # --- 4. TỔNG KẾT CHIẾN LƯỢC AIC PROFESSIONAL ---
     lines.append(sep2)
-    lines.append("  [4. HÀNH ĐỘNG - KẾ HOẠCH GIAO DỊCH]")
-    lines.append(f"  ● Điểm mua Breakout : {bb:,.2f} (Vượt R1 + 1%)")
-    lines.append(f"  ● Chốt lãi 1 (TP1)   : {tp1:,.2f} (Vùng R1 - 2%)")
-    lines.append(f"  ● Chốt lãi 2 (TP2)   : {tp2:,.2f} (Vùng R2 - 2%)")
-    lines.append(f"  ● Chặn lãi (TS)      : {ts:,.2f} (Cập nhật theo MA20/Tenkan)")
-    lines.append(f"  ● Cắt lỗ 1 (SL1)     : {sl1:,.2f} (Thủng S1 - 1%)")
-    lines.append(f"  ● Cắt lỗ 2 (SL2)     : {sl2:,.2f} (Thủng S2 - 3%)")
-    lines.append("")
-
-    # --- 5. RỦI RO ---
-    lines.append("  [5. RỦI RO & QUẢN TRỊ VỐN]")
-    lines.append(f"  ● Risk Score : {rs}/100")
-    lines.append(f"  ● Đánh giá   : {rd.upper()}")
-    lines.append(f"  ● Tỉ lệ R/R   : {rr} (Lợi nhuận: +{val.get('reward_pct', 0)}% / Rủi ro: -{val.get('risk_pct', 0)}%)")
-    if val.get("fomo_warning"):
-        lines.append("  ⚠️ CẢNH BÁO  : GIÁ ĐANG CÁCH QUÁ XA MA20 (>12%) - FOMO CAO!")
-    lines.append("")
-
-    # --- 6. KẾT LUẬN ---
-    lines.append(sep2)
-    lines.append("  [6. KẾT LUẬN CUỐI CÙNG]")
-    lines.append(f"  ● CÓ NÊN THAM GIA: {action.upper()}")
+    lines.append("  🎯 TỔNG KẾT CHIẾN LƯỢC TỪ AI (AIC PROFESSIONAL):")
     
-    # Reason construction
-    reason = f"Cổ phiếu đang {state.replace('_', ' ')}."
-    if action.startswith("YES"):
-        reason += f" Có điểm mua [{adv.get('entry_type', 'N/A')}] đi kèm tỉ lệ Technical Health [{tech.get('health_rating', 'N/A')}] tốt."
-    elif action.startswith("WAIT"):
-        reason += " Cần chờ giá điều chỉnh về vùng hỗ trợ hoặc tích lũy thêm để cải thiện R/R và xung lực."
+    s1_val = f"{s1:,.2f}" if s1 > 0 else "N/A"
+    r1_val = f"{r1:,.2f}" if r1 > 0 else "N/A"
+    bb_val = f"{bb:,.2f}" if bb > 0 else "N/A"
+    sl1_val = f"{sl1:,.2f}" if sl1 > 0 else "N/A"
+    tp1_val = f"{tp1:,.2f}" if tp1 > 0 else "N/A"
+    tp2_val = f"{tp2:,.2f}" if tp2 > 0 else "N/A"
+
+    sig_raw = state_rules.get("signal", "NONE")
+    anti_trap = m.get("anti_trap_block", False)
+    ts_val = f"{ts:,.2f}" if ts > 0 else "MA20"
+    
+    # 1. Định nghĩa Tỷ trọng khuyến nghị (Dựa trên Tín hiệu và Sức khỏe kỹ thuật)
+    target_pct = "0% (Theo dõi thêm)"
+    
+    # Ưu tiên theo Tín hiệu đang nắm giữ (Holding signal)
+    if state == "STRONG": 
+        target_pct = "70–100% (Mua Mạnh/Gồng lãi)"
+    elif state == "ADD_2": 
+        target_pct = "50–70% (Gia tăng 2)"
+    elif state == "ADD_1": 
+        target_pct = "30–50% (Thăm dò/Gia tăng 1)"
+    elif state == "EARLY": 
+        target_pct = "15–25% (Mua sớm)"
+    
+    # Nếu không có vị thế, xét theo sức khỏe kỹ thuật chung
+    elif tech.get('health_score', 0) >= 65:
+        target_pct = "20–40% (Giữ vị thế/Chờ điểm nổ)"
+    elif tech.get('health_score', 0) >= 45:
+        target_pct = "10–20% (Quan sát chặt)"
+    
+    if anti_trap: target_pct += " | 🛡️ CHẶN MUA ĐUỔI"
+
+    # 2. Xây dựng Lý do hệ thống
+    if anti_trap:
+        re_rs = []
+        if m.get('rsi', 0) > 75: re_rs.append(f"RSI quá nhiệt ({m.get('rsi'):.1f})")
+        if (price - result.get('ma20', price)) / result.get('ma20', 1) > 0.1: re_rs.append("Giá rướn quá xa MA20")
+        reason_txt = "⚠️ BỘ LỌC CHẶN MUA: " + ", ".join(re_rs)
     else:
-        reason += " Xu hướng quá yếu hoặc rủi ro cao, không an toàn để giải ngân."
-        
-    lines.append(f"  ● Lý do          : {reason}")
+        # Sử dụng Technical Health thay vì Market State
+        reason_txt = f"Sức khoẻ: {tech.get('health_rating', 'N/A')} ({tech.get('health_score', 0)}đ). Tín hiệu: {sr_signal}."
+
+    # 3. Phân rã hướng dẫn theo vị thế
+    # ─── Lấy thêm risk/opp để tư vấn kẹp hàng thông minh hơn ───
+    _rs  = val.get("risk_score", 50)
+    _opp = val.get("opp_score", 0)
+
+    # Dùng sức khỏe kỹ thuật thay cho Market State (pri_raw)
+    h_rating = tech.get('health_rating', 'Trung bình')
+    
+    if _rs > 75: # Rủi ro cực cao (Downtrend start/Panic)
+        cash_txt = "TUYỆT ĐỐI ĐỨNG NGOÀI. Không bắt dao rơi khi rủi ro cực đại."
+        hold_txt = f"CƠ CẤU THOÁT HÀNG. Canh các nhịp hồi kỹ thuật để hạ tỷ trọng tối đa."
+        trap_txt = f"CẮT LỖ DỨT KHOÁT. Nếu thủng {sl1_val} phải thoát hàng ngay để bảo vệ vốn."
+    elif anti_trap:
+        cash_txt = f"KIÊN NHẪN ĐỢI. Không FOMO. Canh nhặt khi giá lùi về vùng an toàn {s1_val}."
+        hold_txt = f"DỪNG MUA GIA TĂNG. Nâng chặn lãi lên {ts_val}. Chủ động chốt lộc 1/2 tại {tp1_val}."
+        trap_txt = f"CANH HỒI PHỤC HẠ TỶ TRỌNG. Cơ cấu bớt hàng khi giá hồi về vùng kháng cự {r1_val}."
+    elif state in ("STRONG", "ADD_2", "ADD_1"):
+        cash_txt = f"MỞ VỊ THẾ TẤN CÔNG. Vị thế đang khỏe ({h_rating}). Giải ngân thêm khi vượt {r1_val}."
+        hold_txt = f"GIA TĂNG TỶ TRỌNG. Tiếp tục gồng lãi. Mục tiêu kỳ vọng {tp2_val}."
+        trap_txt = f"CƠ HỘI ĐẢO NGƯỢC: Cổ đang có tín hiệu tốt. Giữ vị thế và chờ về mốc SL {sl1_val}."
+    elif h_rating == "Rất mạnh" or h_rating == "Tốt":
+        cash_txt = f"GOM HÀNG KHI HỒI. Sức khoẻ kỹ thuật TỐT. Canh mua thêm khi giá điều chỉnh về {s1_val}."
+        hold_txt = f"GIỮ VÀ TIẾP TỤC QUAN SÁT. Mục tiêu gần: {tp1_val}. Gia tăng khi giá xác nhận vượt {r1_val}."
+        trap_txt = (
+            f"KIÊN NHẪN GIỮ: Xu hướng cơ bản vẫn ổn định. Không vội bán. "
+            f"Giá có thể tự phục hồi về {tp1_val}. Chỉ cắt nếu thủng {sl1_val}."
+        )
+    else:
+        # Các trường hợp Trung bình / Yếu
+        is_weak = _opp < 40 or _rs > 55
+        cash_txt = f"THEO DÕI. Đợi tín hiệu rõ ràng hơn tại vùng {s1_val} hoặc {r1_val}."
+        hold_txt = f"QUAN SÁT. Giữ tỷ trọng an toàn. Điểm chốt lời mục tiêu tại {tp1_val}."
+        if is_weak:
+            trap_txt = (
+                f"CÂN NHẮC HẠ TỶ TRỌNG KHI HỒI: Tín hiệu tổng thể yếu (Opp: {int(_opp)}, Risk: {int(_rs)}). "
+                f"Nếu có nhịp hồi về {r1_val} thì tranh thủ cơ cấu bớt để giảm áp lực."
+            )
+        else:
+            trap_txt = (
+                f"GIỮ VÀ THEO DÕI: Tín hiệu chưa rõ chiều. Không hành động vội. "
+                f"Chỉ thoát nếu thủng SL {sl1_val}. Chỉ trung bình khi có tín hiệu rõ hơn."
+            )
+
+    # ── Điểm Gia Tăng (Topup) ─────────────────────────────────────────────
+    topup_price   = val.get("topup_price", 0)
+    topup_desc    = val.get("topup_desc", "")
+    topup_has_rest = val.get("topup_has_rest", False)
+    adv_type      = adv.get("entry_type", "NONE")
+
+    if topup_price > 0 and adv_type != "NONE":
+        topup_price_fmt = f"{topup_price * 1000:,.0f}"
+        # Tỷ trọng gợi ý gia tăng theo chất lượng tín hiệu
+        if opp >= 75 and conf >= 3:
+            add_pct = "lên Full 100%"
+        elif opp >= 55:
+            add_pct = "thêm 30–50%"
+        elif opp >= 40:
+            add_pct = "thêm 20–30% (thăm dò)"
+        else:
+            add_pct = "chưa đủ uy tín, theo dõi thêm"
+
+        topup_safety = val.get("topup_safety", 0)
+        topup_line = (
+            f"     - 📈 Điểm Gia Tăng (Ngắm trước): "
+            f"Gia tăng {add_pct} khi ĐÓNG CỬA vượt {topup_price_fmt} | {topup_desc} | Mức độ an toàn: {topup_safety}%"
+        )
+    else:
+        topup_line = f"     - 📈 Điểm Gia Tăng (Ngắm trước): Chưa xác định (cần tín hiệu mua ban đầu trước)."
+
+    lines.append(f"  👉 CHIẾN LƯỢC CỐT LÕI : {sr_signal.upper()}")
+    lines.append(f"     ● Tỷ trọng khuyến nghị : {target_pct}")
+    lines.append(f"     - Lý do hệ thống       : {reason_txt}")
+    lines.append(f"     - 🛡️ Vị thế FULL TIỀN    : {cash_txt}")
+    lines.append(f"     - 💎 Vị thế ĐANG CẦM CỔ : {hold_txt}")
+    lines.append(f"     - ✂ Vị thế ĐANG KẸP     : {trap_txt}")
+    lines.append(topup_line)
+    lines.append(f"     - 🎯 Mốc Chốt Lời       : TP1: {tp1_val} | TP2: {tp2_val}")
+    lines.append(f"     - 🛑 Mốc Cắt Lỗ (SL)    : {sl1_val} (Thủng là Bán)")
     lines.append(sep)
     lines.append("")
 

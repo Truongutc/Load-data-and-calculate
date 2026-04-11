@@ -90,33 +90,49 @@ def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     out['MACD_Signal'] = out['MACD'].ewm(span=9, adjust=False).mean()
     out['MACD_Hist'] = out['MACD'] - out['MACD_Signal']
     
-    # ── 8. ADX (Average Directional Index) ────────────────────────────────
-    # Period = 14
+    # ── 8. ADX (Average Directional Index) - PineScript Implementation ─────
     period = 14
-    plus_dm = (out['High'] - out['High'].shift(1)).clip(lower=0)
-    minus_dm = (out['Low'].shift(1) - out['Low']).clip(lower=0)
-    
-    # +DM only if > -DM, else 0
-    plus_dm = np.where((plus_dm > minus_dm), plus_dm, 0)
-    minus_dm = np.where((minus_dm > plus_dm), minus_dm, 0)
+    up = out['High'].diff()
+    down = -out['Low'].diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0)
     
     tr1 = out['High'] - out['Low']
     tr2 = (out['High'] - out['Close'].shift(1)).abs()
     tr3 = (out['Low'] - out['Close'].shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     
-    # Wilder's Smoothing (RMA)
-    tr_smoothed = tr.ewm(com=period-1, adjust=False).mean()
-    plus_di = 100 * (pd.Series(plus_dm).ewm(com=period-1, adjust=False).mean() / tr_smoothed)
-    minus_di = 100 * (pd.Series(minus_dm).ewm(com=period-1, adjust=False).mean() / tr_smoothed)
+    # PineScript RMA = ewm(alpha=1/period)
+    alpha = 1.0 / period
+    tr_rma = tr.ewm(alpha=alpha, adjust=False).mean()
+    plus_di = 100 * (pd.Series(plus_dm).ewm(alpha=alpha, adjust=False).mean() / tr_rma)
+    minus_di = 100 * (pd.Series(minus_dm).ewm(alpha=alpha, adjust=False).mean() / tr_rma)
     
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
-    out['ADX'] = dx.ewm(com=period-1, adjust=False).mean()
+    sum_di = plus_di + minus_di
+    sum_di_safe = np.where(sum_di == 0, 1, sum_di)
+    dx = 100 * (plus_di - minus_di).abs() / sum_di_safe
+    adx = dx.ewm(alpha=alpha, adjust=False).mean()
+    
+    out['ADX'] = adx
     out['DI_Plus'] = plus_di
     out['DI_Minus'] = minus_di
+    
+    # Calculate ADX Color State
+    adx_up = adx > adx.shift(1)
+    di_up = plus_di >= minus_di
+    hl_range = adx <= 20
+    
+    conditions = [
+        hl_range,
+        (~hl_range) & adx_up & di_up,
+        (~hl_range) & (~adx_up) & di_up,
+        (~hl_range) & di_up == False
+    ]
+    choices = ['ORANGE', 'WHITE', 'GREEN', 'RED']
+    out['ADX_Color'] = np.select(conditions, choices, default='ORANGE')
 
-    # ── 9. Pivot (Swing) Points (Fractal n=2) ───────────────────────────
-    # We find peaks/valleys to identify potential S/R
+    # ── 9. Pivot (Swing) Points (Fractal n=2 Strict) ────────────────────
+    # Identify true Swing Highs / Lows matching exactly specific condition
     highs = out['High'].values
     lows = out['Low'].values
     n = 2
@@ -124,17 +140,39 @@ def enrich_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     swing_lows = np.zeros(len(out))
     
     for i in range(n, len(out) - n):
-        # Swing High
-        if highs[i] == max(highs[i-n:i+n+1]):
-            swing_highs[i] = highs[i]
-        # Swing Low
-        if lows[i] == min(lows[i-n:i+n+1]):
-            swing_lows[i] = lows[i]
+        cur_low = lows[i]
+        is_low = True
+        for j in range(1, n + 1):
+            if lows[i - j] <= cur_low or lows[i + j] <= cur_low:
+                is_low = False
+                break
+        if is_low:
+            swing_lows[i] = cur_low
+            
+        cur_high = highs[i]
+        is_high = True
+        for j in range(1, n + 1):
+            if highs[i - j] >= cur_high or highs[i + j] >= cur_high:
+                is_high = False
+                break
+        if is_high:
+            swing_highs[i] = cur_high
             
     out['SwingHigh'] = swing_highs
     out['SwingLow'] = swing_lows
 
-    # ── 10. VSA Helpers ─────────────────────────────────────────────────────
+    # ── 10. AIC Professional Indicators ──────────────────────────────────────
+    # ATR Slope over 5 days to measure price compression (Nén nền)
+    out['ATR14_Slope'] = out['ATR14'].diff(5)
+    
+    # Distance from MA20 (Độ rướn)
+    out['Dist_MA20'] = (out['Close'] - out['MA20']) / out['MA20']
+    
+    # Count green candles in last 3 days (Quá nhiệt)
+    is_green = (out['Close'] > out['Open']).astype(int)
+    out['Green_Count_3'] = is_green.rolling(3).sum()
+
+    # ── 11. VSA Helpers ─────────────────────────────────────────────────────
     out['Spread'] = out['High'] - out['Low']
     out['Avg_Spread_20'] = out['Spread'].rolling(20).mean()
     
